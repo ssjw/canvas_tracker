@@ -538,6 +538,8 @@ def fetch_course_gradebook(base_url: str, token: str, course_id: int, student_id
         "rows": rows,
         "weighted": weighted,
         "group_weights": group_weights,
+        "groups_by_id": groups_by_id,
+        "assignment_groups": ags,
         "computed_overall": computed,
     }
 
@@ -1389,7 +1391,13 @@ def run_streamlit():
                     gb_key = (sid, active_cid)
                     gb_data = gradebook_cache.get(gb_key)
 
-                    if gb_data is None:
+                    needs_refresh = (
+                        gb_data is None
+                        or "assignment_groups" not in gb_data
+                        or any(isinstance(v, (int, float)) for v in gb_data.get("groups_by_id", {}).values())
+                    )
+
+                    if needs_refresh:
                         with st.spinner(f"Loading graded items for {cname}..."):
                             try:
                                 gb_data = fetch_course_gradebook(base_url, token, active_cid, sid)
@@ -1402,6 +1410,44 @@ def run_streamlit():
                         rows = gb_data["rows"]
                         weighted = gb_data["weighted"]
                         computed_overall = gb_data["computed_overall"]
+
+                        # Build robust group name mapping: ag info -> rows fallback -> Group ID
+                        row_group_names = {
+                            r["group_id"]: r["group_name"]
+                            for r in rows
+                            if r.get("group_id") and r.get("group_name")
+                        }
+                        raw_ags = gb_data.get("assignment_groups") or []
+                        key_items = []
+                        zero_items = []
+                        if raw_ags:
+                            for ag in raw_ags:
+                                gid = ag.get("id")
+                                gname = ag.get("name") or row_group_names.get(gid, f"Group {gid}")
+                                gw = ag.get("group_weight", 0.0) or 0.0
+                                try:
+                                    gw = float(gw)
+                                except (ValueError, TypeError):
+                                    gw = 0.0
+                                gtype = classify_assignment_type(gname)
+                                if gw > 0:
+                                    key_items.append((gname, gtype, gw))
+                                else:
+                                    zero_items.append(gname)
+                        elif gb_data.get("group_weights"):
+                            for gid, gw in gb_data["group_weights"].items():
+                                ginfo = gb_data.get("groups_by_id", {}).get(gid, {})
+                                if isinstance(ginfo, dict):
+                                    gname = ginfo.get("name") or row_group_names.get(gid, f"Group {gid}")
+                                else:
+                                    gname = row_group_names.get(gid, f"Group {gid}")
+                                gtype = classify_assignment_type(gname)
+                                if gw > 0:
+                                    key_items.append((gname, gtype, gw))
+                                else:
+                                    zero_items.append(gname)
+
+                        key_items.sort(key=lambda x: x[2], reverse=True)
 
                         gm1, gm2, gm3, gm4 = st.columns([1, 1, 1.6, 1.4])
                         gm1.metric("Official Grade", active_course_info["grade_str"])
@@ -1473,10 +1519,59 @@ def run_streamlit():
                                     "> 2. **Overall Denominator**: Sum of active category weights ($60\\% + 30\\% = 90\\%$), excluding categories with no grades yet (10% Final Exam)."
                                 )
 
+                                st.divider()
+                                if weighted and key_items:
+                                    st.markdown(f"#### 🎯 Dynamic Course Weights for **{cname}**")
+                                    cat_bullets = [f"- **{gname}** ({gtype}): **{gw:g}%**" for gname, gtype, gw in key_items]
+                                    if zero_items:
+                                        cat_bullets.append(f"- *Non-contributing (0.0%)*: {', '.join(zero_items)}")
+                                    st.markdown("\n".join(cat_bullets))
+                                    st.markdown(
+                                        "> **Why weights differ by course:** In Canvas LMS, weights belong to the course's individual "
+                                        "`AssignmentGroup` objects rather than a system-wide setting. Teachers and academic departments configure weights "
+                                        "independently per syllabus."
+                                    )
+                                elif not weighted:
+                                    st.markdown(f"#### 🎯 Dynamic Course Weights for **{cname}**")
+                                    st.info("This course uses an **unweighted total points** grading scheme. All graded assignments contribute based on raw points earned out of points possible.")
+
+                        if weighted and key_items:
+                            badges_html = []
+                            for gname, gtype, gw in key_items:
+                                icon = "📝 " if gtype == "Assessment" else ("🏠 " if gtype == "Homework" else "🏫 ")
+                                badges_html.append(
+                                    f"<span style='display:inline-block; background-color: rgba(59, 130, 246, 0.08); "
+                                    f"border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 6px; padding: 2px 9px; "
+                                    f"margin: 2px 6px 2px 0; font-size: 0.88em;'>"
+                                    f"{icon}<strong>{html.escape(gname)}</strong>: <span style='color: #2563eb; font-weight: 700;'>{gw:g}%</span>"
+                                    f"</span>"
+                                )
+                            zero_note = f"<span style='color: #64748b; font-size: 0.82em;'> • 0% weight: {', '.join(html.escape(z) for z in zero_items)}</span>" if zero_items else ""
+                            st.markdown(
+                                f"<div style='margin: 4px 0 14px 0; line-height: 1.9;'>"
+                                f"<strong>🔑 Weight Key:</strong> {' '.join(badges_html)}{zero_note}"
+                                f"</div>",
+                                unsafe_allow_html=True
+                            )
+                        elif not weighted:
+                            st.markdown(
+                                "<div style='margin: 4px 0 14px 0; font-size: 0.88em;'>"
+                                "<strong>🔑 Weight Key:</strong> "
+                                "<span style='background-color: rgba(100, 116, 139, 0.1); border: 1px solid rgba(100, 116, 139, 0.25); "
+                                "border-radius: 6px; padding: 3px 10px; font-size: 0.95em;'>"
+                                "📊 <strong>Total Points (Unweighted)</strong> — All assignments contribute proportionally based on points possible (no category weighting)."
+                                "</span></div>",
+                                unsafe_allow_html=True
+                            )
+
                         # Check for graded items
                         graded_rows = [
                             r for r in rows
-                            if r.get("score") is not None and not r.get("excused") and not r.get("omit_from_final_grade")
+                            if r.get("score") is not None
+                            and not r.get("excused")
+                            and not r.get("omit_from_final_grade")
+                            and r.get("workflow_state") != "pending_review"
+                            and r.get("status") != "UNGRADED"
                         ]
 
                         gb_filter = st.segmented_control(
@@ -1515,6 +1610,8 @@ def run_streamlit():
                                 status_val = str(row.get("Status", ""))
                                 if "MISSING" in status_val:
                                     return ["background-color: rgba(239, 68, 68, 0.15);"] * len(row)
+                                elif "Pending Review" in status_val:
+                                    return ["background-color: rgba(234, 179, 8, 0.15);"] * len(row)
                                 return [""] * len(row)
 
                             styled_gb_df = gb_df.style.apply(style_gb_rows, axis=1)

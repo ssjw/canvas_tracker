@@ -101,6 +101,9 @@ def compute_overall(rows, weighted, group_weights=None):
             if row.get("omit_from_final_grade") or row.get("excused"):
                 continue
 
+            if row.get("workflow_state") == "pending_review" or row.get("status") == "UNGRADED":
+                continue
+
             score = row.get("score")
             points_possible = row.get("points_possible")
             if score is None or points_possible is None:
@@ -160,6 +163,9 @@ def compute_overall(rows, weighted, group_weights=None):
             if row.get("omit_from_final_grade") or row.get("excused"):
                 continue
 
+            if row.get("workflow_state") == "pending_review" or row.get("status") == "UNGRADED":
+                continue
+
             score = row.get("score")
             points_possible = row.get("points_possible")
             if score is None or points_possible is None:
@@ -195,6 +201,9 @@ def status_for(sub):
     submitted_at = sub.get("submitted_at")
     grade = sub.get("grade")
     raw_score = sub.get("score")
+
+    if workflow_state == "pending_review":
+        return "UNGRADED"
 
     has_submission = (submitted_at is not None or workflow_state == "submitted")
     has_grade = (grade is not None or raw_score is not None or workflow_state == "graded")
@@ -290,13 +299,14 @@ def build_gradebook_rows(submissions, groups_by_id, weighted, sid=None):
             except (ValueError, TypeError):
                 points_possible = None
 
+        workflow_state = sub.get("workflow_state", "unsubmitted")
         excused = bool(sub.get("excused", False))
         omit = bool(assignment.get("omit_from_final_grade", False))
 
         status = status_for(sub)
 
         # Contribution calculation
-        if excused or omit:
+        if excused or omit or workflow_state == "pending_review":
             contribution = None
         else:
             contribution = compute_contribution(score, points_possible, group_weight, weighted)
@@ -327,7 +337,12 @@ def build_gradebook_rows(submissions, groups_by_id, weighted, sid=None):
         else:
             contribution_str = "—"
 
-        status_display = f"{status} (excluded)" if omit else status
+        if workflow_state == "pending_review":
+            status_display = "UNGRADED (Pending Review)"
+        elif omit:
+            status_display = f"{status} (excluded)"
+        else:
+            status_display = status
 
         row = {
             "assignment_id": assignment.get("id"),
@@ -343,6 +358,7 @@ def build_gradebook_rows(submissions, groups_by_id, weighted, sid=None):
             "points_possible": points_possible,
             "excused": excused,
             "omit_from_final_grade": omit,
+            "workflow_state": workflow_state,
             "score_str": score_str,
             "contribution": contribution,
             "contribution_str": contribution_str,
@@ -396,7 +412,10 @@ def display_gradebook(rows, child_name, course_name, weighted, group_weights, en
         elif status_raw == "NO GRADE":
             status_formatted = "[bold orange3]🟠 NO GRADE[/bold orange3]"
         elif status_raw == "UNGRADED":
-            status_formatted = "[bold cyan]🔵 UNGRADED[/bold cyan]"
+            if item.get("workflow_state") == "pending_review":
+                status_formatted = "[bold yellow]⏳ UNGRADED (Pending Review)[/bold yellow]"
+            else:
+                status_formatted = "[bold cyan]🔵 UNGRADED[/bold cyan]"
         elif status_raw == "UPCOMING":
             status_formatted = "[bold yellow]🟡 UPCOMING[/bold yellow]"
         elif status_raw == "GRADED":

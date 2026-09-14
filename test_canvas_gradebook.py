@@ -130,6 +130,19 @@ class TestComputeOverall(unittest.TestCase):
         self.assertIsNotNone(res)
         self.assertAlmostEqual(res, 90.0)
 
+    def test_pending_review_excluded(self):
+        # Row with provisional score but pending_review workflow_state or UNGRADED status must be excluded
+        rows = [
+            {"group_id": 1, "score": 10, "points_possible": 10, "status": "GRADED", "workflow_state": "graded"},
+            {"group_id": 1, "score": 4, "points_possible": 10, "status": "UNGRADED", "workflow_state": "pending_review"},
+        ]
+        group_weights = {1: 100.0}
+        res_weighted = compute_overall(rows, weighted=True, group_weights=group_weights)
+        self.assertAlmostEqual(res_weighted, 100.0)
+
+        res_unweighted = compute_overall(rows, weighted=False)
+        self.assertAlmostEqual(res_unweighted, 100.0)
+
     def test_empty_or_no_graded_data(self):
         self.assertIsNone(compute_overall([], weighted=True))
         self.assertIsNone(compute_overall([], weighted=False))
@@ -166,6 +179,17 @@ class TestStatusFor(unittest.TestCase):
             "score": None,
             "missing": False,
             "workflow_state": "submitted"
+        }
+        self.assertEqual(status_for(sub), "UNGRADED")
+
+    def test_pending_review(self):
+        # Even if provisional score/grade is present, pending_review evaluates as UNGRADED
+        sub = {
+            "submitted_at": "2026-05-01T12:00:00Z",
+            "grade": "4",
+            "score": 4.0,
+            "missing": False,
+            "workflow_state": "pending_review"
         }
         self.assertEqual(status_for(sub), "UNGRADED")
 
@@ -237,6 +261,20 @@ class TestBuildAndSortRows(unittest.TestCase):
                 }
             },
             {
+                "user_id": 100,
+                "score": 4.0,
+                "grade": "4",
+                "missing": False,
+                "workflow_state": "pending_review",
+                "assignment": {
+                    "id": 4,
+                    "name": "Exit Ticket",
+                    "due_at": "2026-04-15T23:59:59Z",
+                    "points_possible": 10,
+                    "assignment_group_id": 50,
+                }
+            },
+            {
                 "user_id": 999,  # different student
                 "score": 10.0,
                 "assignment": {"id": 3, "name": "Other student HW"}
@@ -248,7 +286,7 @@ class TestBuildAndSortRows(unittest.TestCase):
         }
 
         rows = build_gradebook_rows(submissions, groups_by_id, weighted=True, sid=100)
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
 
         # Row 1 check
         r1 = rows[0]
@@ -266,6 +304,15 @@ class TestBuildAndSortRows(unittest.TestCase):
         self.assertEqual(r2["score_str"], "Excused")
         self.assertEqual(r2["contribution_str"], "—")
         self.assertTrue(r2["omit_from_final_grade"])
+
+        # Row 3 check (Pending Review)
+        r3 = rows[2]
+        self.assertEqual(r3["title"], "Exit Ticket")
+        self.assertEqual(r3["status"], "UNGRADED")
+        self.assertEqual(r3["status_display"], "UNGRADED (Pending Review)")
+        self.assertEqual(r3["score_str"], "4/10")
+        self.assertIsNone(r3["contribution"])
+        self.assertEqual(r3["contribution_str"], "—")
 
     def test_sort_gradebook_rows(self):
         rows = [
