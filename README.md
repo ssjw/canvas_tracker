@@ -31,7 +31,17 @@ A lightweight Python CLI tool to identify, aggregate, and display uncompleted (m
 
 ## Running the Tracker
 
-### 1. Interactive Streamlit Web Dashboard
+### 1. Portable Bundle (No Python Install Required)
+For users who do not have Python installed:
+1. Download the zip archive for your operating system from the repository's **Releases** page:
+   - `canvas-tracker-windows-x64.zip` (Windows 10/11)
+   - `canvas-tracker-macos-arm64.zip` (Apple Silicon M1/M2/M3/M4 Macs)
+   - `canvas-tracker-macos-x64.zip` (Intel Macs)
+2. Extract the `.zip` anywhere.
+3. Double-click **`Launch_Canvas_Tracker.bat`** (Windows) or **`Launch_Canvas_Tracker.command`** (macOS).
+4. The dashboard will launch and automatically open in your default browser. Enter your Canvas URL and API token in the sidebar.
+
+### 2. Interactive Streamlit Web Dashboard (From Source)
 Run the dashboard with live auto-refresh and ad-hoc update controls:
 ```bash
 streamlit run canvas_tracker.py
@@ -52,21 +62,16 @@ To only gather and report course grades (skipping detailed assignment queries):
 python canvas_tracker.py --grades-only
 ```
 
-To skip Fastmail draft creation and Signal notifications:
-```bash
-python canvas_tracker.py --skip-notifications
-```
-
 ### 3. Scheduling with Cron
 
-To automate the script to run daily at 4:00 PM and output the report:
+To automate the script to run daily at 4:00 PM and output the report to a log:
 1. Open your crontab:
    ```bash
    crontab -e
    ```
 2. Add a line pointing to your script and virtualenv:
    ```text
-   0 16 * * * cd /home/bob/gemini && /home/bob/gemini/.venv/bin/python src/canvas_tracker/canvas_tracker.py > /dev/null 2>&1
+   0 16 * * * cd /path/to/canvas_tracker && /path/to/canvas_tracker/.venv/bin/python canvas_tracker.py >> canvas_tracker.log 2>&1
    ```
 
 ## Configuration
@@ -84,13 +89,6 @@ base_url = "https://aacps.instructure.com"
 interval_minutes = 60
 active_hours_start = "06:00"
 active_hours_end = "20:00"
-
-[notifications]
-signal_recipient = "+13016398843"
-
-[notifications.recipients]
-"Cora Wheaton" = ["julie5863@gmail.com", "cw.gryffindor@icloud.com"]
-"Owen Wheaton" = ["julie5863@gmail.com", "ow.minecraft@icloud.com"]
 ```
 
 ## 🔒 Security & Privacy Considerations

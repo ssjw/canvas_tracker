@@ -56,13 +56,6 @@ DEFAULT_CONFIG = {
         "active_hours_start": "06:00",
         "active_hours_end": "20:00",
     },
-    "notifications": {
-        "signal_recipient": "+13016398843",
-        "recipients": {
-            "Cora Wheaton": ["julie5863@gmail.com", "cw.gryffindor@icloud.com"],
-            "Owen Wheaton": ["julie5863@gmail.com", "ow.minecraft@icloud.com"],
-        },
-    },
 }
 
 
@@ -107,7 +100,7 @@ def load_config(config_path: str = None) -> dict:
         try:
             with open(target_file, "rb") as f:
                 file_cfg = tomllib.load(f)
-                for section in ["canvas", "refresh", "notifications"]:
+                for section in ["canvas", "refresh"]:
                     if section in file_cfg and isinstance(file_cfg[section], dict):
                         config[section].update(file_cfg[section])
         except Exception as e:
@@ -127,8 +120,6 @@ def load_config(config_path: str = None) -> dict:
         config["refresh"]["active_hours_start"] = os.getenv("CANVAS_ACTIVE_HOURS_START")
     if os.getenv("CANVAS_ACTIVE_HOURS_END"):
         config["refresh"]["active_hours_end"] = os.getenv("CANVAS_ACTIVE_HOURS_END")
-    if os.getenv("SIGNAL_RECIPIENT"):
-        config["notifications"]["signal_recipient"] = os.getenv("SIGNAL_RECIPIENT")
 
     config["canvas"]["base_url"] = config["canvas"]["base_url"].rstrip("/")
     return config
@@ -905,121 +896,6 @@ def wrap_html_report(student_name: str, body_html: str, grades_only: bool = Fals
 
 
 # ---------------------------------------------------------------------------
-# Notification Service (Fastmail JMAP + Signal)
-# ---------------------------------------------------------------------------
-
-async def send_draft_and_notify(html_report: str, subject: str, to_emails: list, console, pdf_bytes=None, signal_recipient: str = None):
-    import httpx, os, json, re
-
-    token = os.environ.get("FASTMAIL_JMAP_TOKEN")
-    if not token:
-        bashrc = os.path.expanduser("~/.bashrc")
-        if os.path.exists(bashrc):
-            m = re.search(r'FASTMAIL_JMAP_TOKEN="?([^"\n]+)"?', open(bashrc, encoding="utf-8").read())
-            if m:
-                token = m.group(1).strip()
-    if not token:
-        print("Error: FASTMAIL_JMAP_TOKEN environment variable is not set.", file=sys.stderr)
-        return
-
-    recipient = signal_recipient or _CONFIG["notifications"].get("signal_recipient", "+13016398843")
-
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        session_resp = await client.get("https://api.fastmail.com/jmap/session", headers={"Authorization": f"Bearer {token}"})
-        session_resp.raise_for_status()
-        session = session_resp.json()
-
-        api_url = session["apiUrl"]
-        account_id = session["primaryAccounts"]["urn:ietf:params:jmap:mail"]
-
-        drafts_req = {
-            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-            "methodCalls": [
-                ["Mailbox/query", {"accountId": account_id, "filter": {"role": "drafts"}}, "0"]
-            ]
-        }
-        res1 = await client.post(api_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=drafts_req)
-        res1.raise_for_status()
-        drafts_id = res1.json()["methodResponses"][0][1]["ids"][0]
-
-        attachment_blob = None
-        upload_url = session.get("uploadUrl", "")
-        if pdf_bytes is not None and upload_url:
-            up = await client.post(
-                upload_url.replace("{accountId}", account_id),
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/pdf"},
-                content=pdf_bytes,
-            )
-            up.raise_for_status()
-            attachment_blob = up.json()["blobId"]
-            console.print(f"[green]PDF uploaded as blob {attachment_blob}[/green]")
-
-        create_entry = {
-            "mailboxIds": {drafts_id: True},
-            "subject": subject,
-            "to": [{"email": e} for e in to_emails],
-            "bodyValues": {
-                "body1": {
-                    "value": html_report,
-                    "isEncodingProblem": False,
-                    "isTruncated": False
-                }
-            },
-            "htmlBody": [{"partId": "body1", "type": "text/html"}],
-            "keywords": {"$draft": True}
-        }
-        if attachment_blob is not None:
-            create_entry["attachments"] = [{
-                "blobId": attachment_blob,
-                "type": "application/pdf",
-                "name": re.sub(r"[^A-Za-z0-9]+", "_", subject) + ".pdf",
-                "disposition": "attachment",
-            }]
-
-        draft_req = {
-            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-            "methodCalls": [
-                [
-                    "Email/set",
-                    {"accountId": account_id, "create": {"draft1": create_entry}},
-                    "0"
-                ]
-            ]
-        }
-        resp3 = await client.post(api_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=draft_req)
-        resp3.raise_for_status()
-
-        data = resp3.json()
-        created = data["methodResponses"][0][1].get("created", {})
-        if "draft1" not in created:
-            console.print(f"[red]Error creating draft. Server response: {json.dumps(data)}[/red]")
-            return
-
-        draft_id = created["draft1"]["id"]
-        console.print(f"[green]Draft created successfully! (ID: {draft_id})[/green]")
-
-        draft_url = f"https://app.fastmail.com/mail/Drafts/{draft_id}"
-        message = f"Canvas Draft Ready ({subject})! Review and send here: {draft_url}"
-
-        console.print(f"[cyan]Sending Signal notification to {recipient} via daemon API...[/cyan]")
-        rpc_payload = {
-            "jsonrpc": "2.0",
-            "method": "send",
-            "params": {
-                "message": message,
-                "recipient": [recipient]
-            },
-            "id": 1
-        }
-
-        async with httpx.AsyncClient() as http_client:
-            signal_resp = await http_client.post("http://127.0.0.1:8080/api/v1/rpc", json=rpc_payload)
-            signal_resp.raise_for_status()
-
-        console.print("[green]Notification sent successfully.[/green]")
-
-
-# ---------------------------------------------------------------------------
 # CLI Runner
 # ---------------------------------------------------------------------------
 
@@ -1029,11 +905,6 @@ def main():
         "-g", "--grades-only",
         action="store_true",
         help="Only gather and report course grades, skipping assignment details"
-    )
-    parser.add_argument(
-        "-s", "--skip-notifications",
-        action="store_true",
-        help="Skip creating email drafts and sending Signal notifications"
     )
     parser.add_argument(
         "-c", "--config",
@@ -1065,7 +936,6 @@ def main():
 
     observees = data["observees"]
     student_map = data["student_map"]
-    student_ids = data["student_ids"]
     student_grades = data["student_grades"]
     student_group_grades = data["student_group_grades"]
     student_assignments = data["student_assignments"]
@@ -1076,16 +946,10 @@ def main():
 
     console.print(f"Found [green]{len(observees)}[/green] student(s): {', '.join(student_map.values())}\n")
 
-    email_recipients = config["notifications"].get("recipients", {})
-    full_html_report = f"<h1>{'Course Grades' if args.grades_only else 'Incomplete Assignments'} Report</h1>\n<p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>\n"
-
     for sid, sname in student_map.items():
         assignments = student_assignments[sid]
         ag_grades = student_group_grades.get(sid, [])
         grades = student_grades[sid]
-
-        student_md = build_student_html(sid, sname, assignments, ag_grades, grades, grades_only=args.grades_only)
-        full_html_report += student_md + "\n"
 
         # Terminal Rich output
         if not args.grades_only:
@@ -1134,38 +998,6 @@ def main():
             grades_table.add_row(g_item["course"], g_item["grade_str"])
         console.print(grades_table)
         console.print()
-
-        # Notifications
-        to_emails = email_recipients.get(sname, [])
-        if to_emails:
-            console.print(f"[cyan]Drafting HTML email for {sname} via Fastmail JMAP...[/cyan]")
-            current_time_str = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-            subject = f"Canvas Grades Report: {sname} ({current_time_str})" if args.grades_only else f"Canvas Assignments Report: {sname} ({current_time_str})"
-            if not args.skip_notifications:
-                import asyncio
-                try:
-                    pdf_bytes = None
-                    try:
-                        pdf_bytes = html_to_pdf_bytes(student_md)
-                    except Exception as e:
-                        console_err.print(f"[yellow]Could not render PDF for {sname}: {e}[/yellow]")
-                    asyncio.run(send_draft_and_notify(student_md, subject, to_emails, console, pdf_bytes=pdf_bytes))
-                except Exception as e:
-                    import traceback
-                    console_err.print(f"[red]Error sending notification for {sname}: {e}[/red]")
-                    traceback.print_exc(file=sys.stderr)
-            else:
-                console.print(f"[yellow]Skipping notifications due to --skip-notifications flag.[/yellow]")
-
-    # Save output file
-    output_filename = "course_grades.html" if args.grades_only else "incomplete_assignments.html"
-    output_file = os.path.join(os.getcwd(), output_filename)
-    try:
-        with open(output_file, "w") as f:
-            f.write(full_html_report)
-        console.print(f"[green]Saved report to {output_file}[/green]")
-    except Exception as e:
-        console_err.print(f"[red]Error writing report file: {e}[/red]")
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,141 @@
+name: Build Portable Bundles
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Portable Python (Windows x64)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/astral-sh/python-build-standalone/releases/download/20240224/cpython-3.11.8+20240224-x86_64-pc-windows-msvc-shared-install_only.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile python.tar.gz
+          tar -xzf python.tar.gz
+
+      - name: Install Python Dependencies
+        shell: cmd
+        run: |
+          python\python.exe -m pip install --no-warn-script-location --upgrade pip
+          python\python.exe -m pip install --no-warn-script-location -r requirements.txt
+
+      - name: Assemble Windows Bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "bundle/canvas-tracker"
+          Move-Item -Path "python" -Destination "bundle/canvas-tracker/"
+          Copy-Item -Path "Launch_Canvas_Tracker.bat" -Destination "bundle/canvas-tracker/"
+          Copy-Item -Path "canvas_tracker.py" -Destination "bundle/canvas-tracker/"
+          Copy-Item -Path "canvas_gradebook.py" -Destination "bundle/canvas-tracker/"
+          Copy-Item -Path "README.md" -Destination "bundle/canvas-tracker/"
+          Copy-Item -Path "requirements.txt" -Destination "bundle/canvas-tracker/"
+          Compress-Archive -Path "bundle/canvas-tracker" -DestinationPath "canvas-tracker-windows-x64.zip"
+
+      - name: Upload Windows Bundle Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvas-tracker-windows-x64
+          path: canvas-tracker-windows-x64.zip
+
+  build-macos-arm64:
+    name: Build macOS (Apple Silicon M1/M2/M3/M4)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Portable Python (macOS aarch64)
+        run: |
+          curl -L -o python.tar.gz https://github.com/astral-sh/python-build-standalone/releases/download/20240224/cpython-3.11.8+20240224-aarch64-apple-darwin-install_only.tar.gz
+          tar -xzf python.tar.gz
+
+      - name: Install Python Dependencies
+        run: |
+          ./python/bin/python3 -m pip install --upgrade pip
+          ./python/bin/python3 -m pip install -r requirements.txt
+
+      - name: Assemble macOS Bundle
+        run: |
+          mkdir -p bundle/canvas-tracker
+          mv python bundle/canvas-tracker/
+          cp Launch_Canvas_Tracker.command bundle/canvas-tracker/
+          cp canvas_tracker.py bundle/canvas-tracker/
+          cp canvas_gradebook.py bundle/canvas-tracker/
+          cp README.md bundle/canvas-tracker/
+          cp requirements.txt bundle/canvas-tracker/
+          chmod +x bundle/canvas-tracker/Launch_Canvas_Tracker.command
+          cd bundle
+          zip -r ../canvas-tracker-macos-arm64.zip canvas-tracker
+
+      - name: Upload macOS Apple Silicon Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvas-tracker-macos-arm64
+          path: canvas-tracker-macos-arm64.zip
+
+  build-macos-x64:
+    name: Build macOS (Intel x86_64)
+    runs-on: macos-13
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Portable Python (macOS x86_64)
+        run: |
+          curl -L -o python.tar.gz https://github.com/astral-sh/python-build-standalone/releases/download/20240224/cpython-3.11.8+20240224-x86_64-apple-darwin-install_only.tar.gz
+          tar -xzf python.tar.gz
+
+      - name: Install Python Dependencies
+        run: |
+          ./python/bin/python3 -m pip install --upgrade pip
+          ./python/bin/python3 -m pip install -r requirements.txt
+
+      - name: Assemble macOS Bundle
+        run: |
+          mkdir -p bundle/canvas-tracker
+          mv python bundle/canvas-tracker/
+          cp Launch_Canvas_Tracker.command bundle/canvas-tracker/
+          cp canvas_tracker.py bundle/canvas-tracker/
+          cp canvas_gradebook.py bundle/canvas-tracker/
+          cp README.md bundle/canvas-tracker/
+          cp requirements.txt bundle/canvas-tracker/
+          chmod +x bundle/canvas-tracker/Launch_Canvas_Tracker.command
+          cd bundle
+          zip -r ../canvas-tracker-macos-x64.zip canvas-tracker
+
+      - name: Upload macOS Intel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvas-tracker-macos-x64
+          path: canvas-tracker-macos-x64.zip
+
+  release:
+    name: Publish Release
+    needs: [build-windows, build-macos-arm64, build-macos-x64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/canvas-tracker-windows-x64/canvas-tracker-windows-x64.zip
+            artifacts/canvas-tracker-macos-arm64/canvas-tracker-macos-arm64.zip
+            artifacts/canvas-tracker-macos-x64/canvas-tracker-macos-x64.zip
+          generate_release_notes: true
