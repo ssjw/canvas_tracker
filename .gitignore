@@ -1,0 +1,61 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Environment variables & local secrets
+.env
+.env.*
+!.env.example
+config.toml
+!config.toml.example
+.streamlit/secrets.toml
+
+# Build & packaging artifacts (portable bundle build)
+bundle/
+python/
+python.tar.gz
+*.zip
+artifacts/
+build/
+dist/
+*.egg-info/
+
+# Generated reports & logs
+*.log
+canvas_tracker.log
+*_report.html
+*_report.pdf
+course_grades.html
+
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Local AI agent & assistant scratch directories
+.agents/
+.claude/
+.gemini/
