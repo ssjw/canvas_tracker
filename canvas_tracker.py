@@ -82,19 +82,18 @@ def load_config(config_path: str = None) -> dict:
         target_file = Path(config_path)
     else:
         xdg_home = os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config"))
-        xdg_file = Path(xdg_home) / "canvas_tracker" / "config.toml"
-        mac_app_support = Path.home() / "Library" / "Application Support" / "canvas_tracker" / "config.toml"
-        local_file = Path.cwd() / "config.toml"
-        script_file = Path(__file__).resolve().parent / "config.toml"
-
-        if xdg_file.exists():
-            target_file = xdg_file
-        elif mac_app_support.exists():
-            target_file = mac_app_support
-        elif local_file.exists():
-            target_file = local_file
-        elif script_file.exists():
-            target_file = script_file
+        candidates = [
+            Path(xdg_home) / "canvas_tracker" / "config.toml",
+            Path(xdg_home) / "canvas-tracker" / "config.toml",
+            Path.home() / "Library" / "Application Support" / "canvas_tracker" / "config.toml",
+            Path.home() / "Library" / "Application Support" / "canvas-tracker" / "config.toml",
+            Path.cwd() / "config.toml",
+            Path(__file__).resolve().parent / "config.toml",
+        ]
+        for cand in candidates:
+            if cand.exists():
+                target_file = cand
+                break
 
     if target_file and target_file.exists() and tomllib:
         try:
@@ -1032,7 +1031,7 @@ def run_streamlit():
         token = st.sidebar.text_input("Canvas API Token", type="password", help="Enter your Canvas API token or configure it in .env")
 
     st.sidebar.divider()
-    st.sidebar.subheader("🔄 Refresh Configuration")
+    st.sidebar.subheader("Refresh Configuration")
 
     interval_min = st.sidebar.number_input(
         "Refresh Interval (Minutes)",
@@ -1131,7 +1130,7 @@ def run_streamlit():
 
                 m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Active Courses", len(grades))
-                m2.metric("Missing", missing_cnt, delta=f"-{missing_cnt}" if missing_cnt > 0 else None, delta_color="inverse")
+                m2.metric("Missing", missing_cnt)
                 m3.metric("No Grade", nograde_cnt)
                 m4.metric("Upcoming", upcoming_cnt)
                 m5.metric("Ungraded", ungraded_cnt)
