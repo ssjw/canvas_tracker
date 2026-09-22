@@ -14,6 +14,7 @@ Potential Security Implications:
 
 import os
 import sys
+import copy
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -189,6 +190,267 @@ def compute_overall(rows, weighted, group_weights=None):
         return None
 
 
+def attach_grade_impacts(rows, weighted, group_weights=None):
+    """
+    Calculate and attach grade drag and potential recovery gain to each row in rows in-place.
+
+    - grade_drag: G_current - G_without_item (in percentage points)
+      Negative if this assignment is pulling the overall grade down.
+    - potential_gain: G_if_full_credit - G_current (in percentage points)
+      Positive if bringing this assignment to 100% would increase the overall grade.
+    - Also attaches string/display helpers: grade_drag_str, potential_gain_str, grade_impact_display.
+    """
+    overall = compute_overall(rows, weighted, group_weights)
+
+    for i, row in enumerate(rows):
+        row["grade_drag"] = None
+        row["grade_drag_str"] = "—"
+        row["potential_gain"] = None
+        row["potential_gain_str"] = "—"
+        row["grade_impact_display"] = "—"
+
+        if row.get("omit_from_final_grade") or row.get("excused"):
+            continue
+        if row.get("workflow_state") == "pending_review" or row.get("status") == "UNGRADED":
+            continue
+
+        score = row.get("score")
+        pts = row.get("points_possible")
+        if pts is None:
+            continue
+        try:
+            p = float(pts)
+        except (ValueError, TypeError):
+            continue
+        if p <= 0:
+            continue
+
+        # If the row has a score (including 0), it is active in compute_overall
+        if score is not None and overall is not None:
+            try:
+                s = float(score)
+            except (ValueError, TypeError):
+                continue
+
+            # 1. Grade without this item
+            other_rows = [r for idx, r in enumerate(rows) if idx != i]
+            grade_without = compute_overall(other_rows, weighted, group_weights)
+            if grade_without is not None:
+                drag = overall - grade_without
+                row["grade_drag"] = drag
+                row["grade_without"] = grade_without
+                if drag <= -0.005:
+                    row["grade_drag_str"] = f"{drag:.2f}%"
+                    row["grade_impact_display"] = f"▼ {drag:.2f}%"
+                elif drag >= 0.005:
+                    row["grade_drag_str"] = f"+{drag:.2f}%"
+                    row["grade_impact_display"] = f"▲ +{drag:.2f}%"
+                else:
+                    row["grade_drag_str"] = "+0.00%"
+                    row["grade_impact_display"] = "—"
+
+            # 2. Potential gain if full credit (s = p)
+            if s < p:
+                sim_rows = []
+                for idx, r in enumerate(rows):
+                    if idx == i:
+                        sim_r = copy.copy(r)
+                        sim_r["score"] = p
+                        sim_rows.append(sim_r)
+                    else:
+                        sim_rows.append(r)
+                grade_full = compute_overall(sim_rows, weighted, group_weights)
+                if grade_full is not None:
+                    gain = max(0.0, grade_full - overall)
+                    row["potential_gain"] = gain
+                    row["potential_gain_str"] = f"+{gain:.2f}%" if gain >= 0.005 else "0.00%"
+            else:
+                row["potential_gain"] = 0.0
+                row["potential_gain_str"] = "0.00%"
+        elif score is None and overall is not None:
+            # Ungraded or missing item with no score entered yet
+            # Calculate potential gain if completed for full credit
+            sim_rows = []
+            for idx, r in enumerate(rows):
+                if idx == i:
+                    sim_r = copy.copy(r)
+                    sim_r["score"] = p
+                    sim_r["status"] = "GRADED"
+                    sim_rows.append(sim_r)
+                else:
+                    sim_rows.append(r)
+            grade_full = compute_overall(sim_rows, weighted, group_weights)
+            if grade_full is not None:
+                gain = max(0.0, grade_full - overall)
+                row["potential_gain"] = gain
+                row["potential_gain_str"] = f"+{gain:.2f}%" if gain >= 0.005 else "0.00%"
+
+    return rows
+
+
+def compute_category_health(rows, weighted, group_weights=None, groups_by_id=None):
+    """
+    Calculate summary health metrics for each assignment category / group:
+    - Points earned and possible
+    - Category percentage
+    - Configured weight & normalized active weight
+    - Weighted contribution toward final grade
+    - Category drag vs. course average
+    """
+    overall = compute_overall(rows, weighted, group_weights)
+    groups_by_id = groups_by_id or {}
+    group_weights = group_weights or {}
+
+    cat_data = {}
+    for r in rows:
+        gid = r.get("group_id") if r.get("group_id") is not None else r.get("assignment_group_id")
+        if gid is None:
+            continue
+        if gid not in cat_data:
+            ginfo = groups_by_id.get(gid, {}) if isinstance(groups_by_id, dict) else {}
+            gname = ""
+            if isinstance(ginfo, dict):
+                gname = ginfo.get("name", "")
+            if not gname:
+                gname = r.get("group_name", f"Group {gid}")
+
+            wt = group_weights.get(gid)
+            if wt is None and isinstance(ginfo, dict):
+                wt = ginfo.get("group_weight")
+            if wt is None:
+                wt = r.get("group_weight")
+            try:
+                wt = float(wt) if wt is not None else 0.0
+            except (ValueError, TypeError):
+                wt = 0.0
+
+            cat_data[gid] = {
+                "group_id": gid,
+                "name": gname,
+                "type": classify_assignment_type(gname),
+                "weight": wt,
+                "earned": 0.0,
+                "possible": 0.0,
+                "has_graded": False,
+                "total_items": 0,
+                "graded_items": 0,
+                "missing_items": 0,
+            }
+
+        c = cat_data[gid]
+        c["total_items"] += 1
+        if r.get("status") == "MISSING":
+            c["missing_items"] += 1
+
+        if r.get("omit_from_final_grade") or r.get("excused"):
+            continue
+        if r.get("workflow_state") == "pending_review" or r.get("status") == "UNGRADED":
+            continue
+
+        score = r.get("score")
+        pts = r.get("points_possible")
+        if score is None or pts is None:
+            continue
+        try:
+            s = float(score)
+            p = float(pts)
+        except (ValueError, TypeError):
+            continue
+        if p <= 0:
+            continue
+
+        c["earned"] += s
+        c["possible"] += p
+        c["has_graded"] = True
+        c["graded_items"] += 1
+
+    # Include any assignment groups configured with weights that have no rows yet
+    if isinstance(groups_by_id, dict):
+        for gid, ginfo in groups_by_id.items():
+            if gid not in cat_data and isinstance(ginfo, dict):
+                gname = ginfo.get("name", f"Group {gid}")
+                wt = group_weights.get(gid, ginfo.get("group_weight", 0.0))
+                try:
+                    wt = float(wt) if wt is not None else 0.0
+                except (ValueError, TypeError):
+                    wt = 0.0
+                cat_data[gid] = {
+                    "group_id": gid,
+                    "name": gname,
+                    "type": classify_assignment_type(gname),
+                    "weight": wt,
+                    "earned": 0.0,
+                    "possible": 0.0,
+                    "has_graded": False,
+                    "total_items": 0,
+                    "graded_items": 0,
+                    "missing_items": 0,
+                }
+
+    # Compute normalized active weights
+    active_weight_sum = sum(
+        c["weight"] for c in cat_data.values()
+        if c["possible"] > 0 and c["weight"] > 0
+    )
+
+    categories = []
+    for c in cat_data.values():
+        is_active = c["possible"] > 0
+        score_pct = (c["earned"] / c["possible"] * 100.0) if is_active else None
+
+        if weighted and active_weight_sum > 0 and is_active and c["weight"] > 0:
+            norm_wt = (c["weight"] / active_weight_sum) * 100.0
+            weighted_contrib = norm_wt * (score_pct / 100.0)
+        else:
+            norm_wt = c["weight"]
+            weighted_contrib = score_pct if score_pct is not None else 0.0
+
+        drag_vs_overall = (score_pct - overall) if (score_pct is not None and overall is not None) else None
+
+        c["is_active"] = is_active
+        c["score_pct"] = score_pct
+        c["normalized_weight"] = norm_wt
+        c["weighted_contribution"] = weighted_contrib
+        c["drag_vs_overall"] = drag_vs_overall
+        categories.append(c)
+
+    categories.sort(key=lambda x: (x["is_active"], x["weight"], x["possible"]), reverse=True)
+    return categories
+
+
+def simulate_course_grade(rows, weighted, group_weights=None, score_overrides=None):
+    """
+    Simulate the course overall grade with a set of hypothetical score overrides.
+    score_overrides: dict mapping assignment_id (or int index) to new_score (float/int).
+    """
+    if not score_overrides:
+        return compute_overall(rows, weighted, group_weights)
+
+    sim_rows = []
+    for idx, r in enumerate(rows):
+        aid = r.get("assignment_id")
+        sim_r = copy.copy(r)
+
+        override = None
+        if aid is not None and aid in score_overrides:
+            override = score_overrides[aid]
+        elif r.get("title") in score_overrides:
+            override = score_overrides[r.get("title")]
+        elif idx in score_overrides:
+            override = score_overrides[idx]
+
+        if override is not None:
+            sim_r["score"] = float(override)
+            sim_r["workflow_state"] = "graded"
+            sim_r["status"] = "GRADED"
+            sim_r["excused"] = False
+            sim_r["omit_from_final_grade"] = False
+
+        sim_rows.append(sim_r)
+
+    return compute_overall(sim_rows, weighted, group_weights)
+
+
 def status_for(sub):
     """
     Derive the assignment status category: MISSING, NO GRADE, UNGRADED, UPCOMING, or GRADED.
@@ -349,7 +611,7 @@ def build_gradebook_rows(submissions, groups_by_id, weighted, sid=None):
             "title": assignment.get("name", "Untitled"),
             "due_raw": due_at,
             "due_str": format_date(due_at),
-            "type": classify_assignment_type(group_name),
+            "type": classify_assignment_type(group_name, assignment),
             "group_id": ag_id,
             "group_name": group_name,
             "group_weight": group_weight,
@@ -369,6 +631,27 @@ def build_gradebook_rows(submissions, groups_by_id, weighted, sid=None):
             "assignment": assignment,
         }
         rows.append(row)
+
+    # Extract group weights to attach grade impacts automatically
+    g_weights = {}
+    if isinstance(groups_by_id, dict):
+        for gid, ginfo in groups_by_id.items():
+            if isinstance(ginfo, dict) and ginfo.get("group_weight") is not None:
+                try:
+                    g_weights[gid] = float(ginfo["group_weight"])
+                except (ValueError, TypeError):
+                    pass
+            elif isinstance(ginfo, (int, float)):
+                g_weights[gid] = float(ginfo)
+    for r in rows:
+        gid = r.get("group_id")
+        if gid is not None and gid not in g_weights and r.get("group_weight") is not None:
+            try:
+                g_weights[gid] = float(r["group_weight"])
+            except (ValueError, TypeError):
+                pass
+
+    attach_grade_impacts(rows, weighted, group_weights=g_weights)
     return rows
 
 

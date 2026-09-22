@@ -208,19 +208,31 @@ def parse_date(date_str):
         return datetime.max.replace(tzinfo=timezone.utc)
 
 
-def classify_assignment_type(group_name):
-    """Classify the assignment type based on the assignment group name."""
+def classify_assignment_type(group_name, assignment=None):
+    """Classify the assignment type to align directly with the course's weight groups
+    (assignment groups), while properly identifying special categories like 'Ungraded'.
+    """
+    if assignment and isinstance(assignment, dict):
+        if (
+            assignment.get("grading_type") == "not_graded"
+            or "not_graded" in (assignment.get("submission_types") or [])
+        ):
+            return "Ungraded"
+
     if not group_name:
+        if assignment and isinstance(assignment, dict) and assignment.get("points_possible") == 0:
+            return "Ungraded"
         return "Class Assignment"
-    name_lower = group_name.lower()
-    if "homework" in name_lower or name_lower == "hw":
+
+    name_clean = str(group_name).strip()
+    name_lower = name_clean.lower()
+
+    if name_lower in ["ungraded", "not graded", "non-graded"]:
+        return "Ungraded"
+    if name_lower == "hw":
         return "Homework"
-    elif any(k in name_lower for k in ["assessment", "test", "quiz", "sclt", "quarterly"]):
-        return "Assessment"
-    elif any(k in name_lower for k in ["assignment", "class", "practice", "work"]):
-        return "Class Assignment"
-    else:
-        return group_name.strip()
+
+    return name_clean
 
 
 def clean_course_name(name: str) -> str:
@@ -477,7 +489,14 @@ def fetch_course_gradebook(base_url: str, token: str, course_id: int, student_id
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
 
-    from canvas_gradebook import build_gradebook_rows, sort_gradebook_rows, compute_overall
+    from canvas_gradebook import (
+        build_gradebook_rows,
+        sort_gradebook_rows,
+        compute_overall,
+        attach_grade_impacts,
+        compute_category_health,
+        simulate_course_grade,
+    )
 
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
@@ -517,10 +536,12 @@ def fetch_course_gradebook(base_url: str, token: str, course_id: int, student_id
         wt > 0 for wt in group_weights.values()
     )
 
-    # 4. Build and sort rows
+    # 4. Build, sort rows, attach impacts & category health
     rows = build_gradebook_rows(submissions, groups_by_id, weighted, sid=student_id)
+    attach_grade_impacts(rows, weighted, group_weights)
     rows = sort_gradebook_rows(rows)
     computed = compute_overall(rows, weighted, group_weights)
+    category_health = compute_category_health(rows, weighted, group_weights, groups_by_id)
 
     return {
         "course_id": course_id,
@@ -531,6 +552,7 @@ def fetch_course_gradebook(base_url: str, token: str, course_id: int, student_id
         "groups_by_id": groups_by_id,
         "assignment_groups": ags,
         "computed_overall": computed,
+        "category_health": category_health,
     }
 
 
@@ -735,7 +757,8 @@ def collect_canvas_data(base_url: str = None, token: str = None, grades_only: bo
                 "points": assignment.get("points_possible", 0),
                 "status": status,
                 "url": assignment.get("html_url", ""),
-                "type": classify_assignment_type(assignment.get("assignment_group_name"))
+                "type": classify_assignment_type(assignment.get("assignment_group_name"), assignment),
+                "assignment_group_name": assignment.get("assignment_group_name")
             })
 
     # Sort incomplete assignments chronologically by due date (oldest/overdue first, undated last)
@@ -1014,6 +1037,7 @@ def is_streamlit_running() -> bool:
 
 def run_streamlit():
     import streamlit as st
+    import streamlit.components.v1 as components
     import pandas as pd
 
     st.set_page_config(page_title="Canvas Student Tracker", page_icon="🎓", layout="wide")
@@ -1045,8 +1069,6 @@ def run_streamlit():
     col_h1, col_h2 = st.sidebar.columns(2)
     active_start = col_h1.text_input("Active Start", value=refresh_cfg.get("active_hours_start", "06:00"))
     active_end = col_h2.text_input("Active End", value=refresh_cfg.get("active_hours_end", "20:00"))
-
-    grades_only = st.sidebar.checkbox("Grades Only", value=False, help="Skip querying detailed assignment submissions")
 
     # Ad-hoc refresh button
     if st.sidebar.button("🔄 Refresh Now", width="stretch", type="primary"):
@@ -1085,13 +1107,14 @@ def run_streamlit():
         if should_fetch:
             with st.spinner("Fetching data from Canvas..."):
                 try:
-                    data = collect_canvas_data(base_url, token, grades_only=grades_only)
+                    data = collect_canvas_data(base_url, token)
                     st.session_state["canvas_data"] = data
                     st.session_state["last_fetch_time"] = datetime.now()
                     if "cached_gradebooks" in st.session_state:
                         st.session_state["cached_gradebooks"].clear()
                 except Exception as e:
                     st.error(f"Error connecting to Canvas API: {e}")
+                    st.session_state["last_fetch_time"] = datetime.now()
                     if existing_data:
                         data = existing_data
                     else:
@@ -1112,6 +1135,82 @@ def run_streamlit():
             return
 
         st.caption(f"Last updated: **{fetched_at.strftime('%Y-%m-%d %I:%M:%S %p')}** | Refresh: **Every {interval_min}m** (Active: **{active_start} – {active_end}**)")
+
+        # Client-side focus & timer manager:
+        # 1. Triggers immediate refresh when switching back to tab if elapsed >= interval_min.
+        # 2. Reschedules remaining countdown to real wall-clock time if returning before expiry.
+        # 3. Completely resets the timer countdown whenever a refresh completes.
+        last_fetch_time = st.session_state.get("last_fetch_time") or datetime.now()
+        last_fetch_ts = int(last_fetch_time.timestamp() * 1000)
+        interval_ms = int(interval_min * 60 * 1000)
+        is_active_js = "true" if within_window else "false"
+
+        components.html(
+            f"""
+            <script>
+            (function() {{
+                const lastFetch = {last_fetch_ts};
+                const intervalMs = {interval_ms};
+                const isActive = {is_active_js};
+
+                window.parent._canvasTrackerRefreshing = false;
+
+                function triggerRefresh() {{
+                    if (window.parent._canvasTrackerRefreshing) return false;
+                    const parentDoc = window.parent.document;
+                    const buttons = parentDoc.querySelectorAll('button');
+                    for (const btn of buttons) {{
+                        if (btn.innerText && btn.innerText.includes('Refresh Now')) {{
+                            window.parent._canvasTrackerRefreshing = true;
+                            btn.click();
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }}
+
+                function checkAndSchedule() {{
+                    if (!isActive) return;
+                    const now = Date.now();
+                    const elapsed = now - lastFetch;
+
+                    if (elapsed >= intervalMs) {{
+                        triggerRefresh();
+                    }} else {{
+                        const remaining = Math.max(1000, intervalMs - elapsed);
+                        if (window.parent._canvasTrackerTimer) {{
+                            clearTimeout(window.parent._canvasTrackerTimer);
+                        }}
+                        window.parent._canvasTrackerTimer = setTimeout(function() {{
+                            triggerRefresh();
+                        }}, remaining);
+                    }}
+                }}
+
+                if (!window.parent._canvasTrackerListenersAttached) {{
+                    window.parent.addEventListener("visibilitychange", function() {{
+                        if (window.parent.document.visibilityState === "visible") {{
+                            if (window.parent._canvasTrackerCheck) {{
+                                window.parent._canvasTrackerCheck();
+                            }}
+                        }}
+                    }});
+                    window.parent.addEventListener("focus", function() {{
+                        if (window.parent._canvasTrackerCheck) {{
+                            window.parent._canvasTrackerCheck();
+                        }}
+                    }});
+                    window.parent._canvasTrackerListenersAttached = true;
+                }}
+
+                window.parent._canvasTrackerCheck = checkAndSchedule;
+                checkAndSchedule();
+            }})();
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
 
         tabs = st.tabs([student_map[sid] for sid in student_ids])
 
@@ -1218,6 +1317,12 @@ def run_streamlit():
                     st.divider()
                     st.markdown(f"### 📖 Detailed Gradebook: **{cname}**")
 
+                    from canvas_gradebook import (
+                        attach_grade_impacts,
+                        compute_category_health,
+                        simulate_course_grade,
+                    )
+
                     gradebook_cache = st.session_state.setdefault("cached_gradebooks", {})
                     gb_key = (sid, active_cid)
                     gb_data = gradebook_cache.get(gb_key)
@@ -1226,6 +1331,8 @@ def run_streamlit():
                         gb_data is None
                         or "assignment_groups" not in gb_data
                         or any(isinstance(v, (int, float)) for v in gb_data.get("groups_by_id", {}).values())
+                        or "category_health" not in gb_data
+                        or not any("grade_drag" in r for r in gb_data.get("rows", []))
                     )
 
                     if needs_refresh:
@@ -1240,7 +1347,9 @@ def run_streamlit():
                     if gb_data:
                         rows = gb_data["rows"]
                         weighted = gb_data["weighted"]
-                        computed_overall = gb_data["computed_overall"]
+                        # Refresh grade impacts to ensure latest display formatting on cached data
+                        attach_grade_impacts(rows, weighted, gb_data.get("group_weights"))
+                        computed_overall = gb_data.get("computed_overall")
 
                         # Build robust group name mapping: ag info -> rows fallback -> Group ID
                         row_group_names = {
@@ -1395,7 +1504,7 @@ def run_streamlit():
                                 unsafe_allow_html=True
                             )
 
-                        # Check for graded items
+                        # Filter and Sort Controls
                         graded_rows = [
                             r for r in rows
                             if r.get("score") is not None
@@ -1405,32 +1514,88 @@ def run_streamlit():
                             and r.get("status") != "UNGRADED"
                         ]
 
-                        gb_filter = st.segmented_control(
-                            f"Filter assignments for {cname}:",
-                            options=["All Items", "Graded Items (Contributing)", "Incomplete Only"],
-                            default="All Items",
-                            key=f"gb_filter_{sid}_{active_cid}"
-                        ) or "All Items"
+                        col_filter, col_sort = st.columns([1.5, 1.5])
+                        with col_filter:
+                            gb_filter = st.segmented_control(
+                                f"Filter assignments for {cname}:",
+                                options=["All Items", "Graded Items (Contributing)", "Incomplete Only"],
+                                default="All Items",
+                                key=f"gb_filter_{sid}_{active_cid}"
+                            ) or "All Items"
+
+                        with col_sort:
+                            gb_sort = st.selectbox(
+                                "Sort assignments by:",
+                                options=[
+                                    "📅 Due Date (Oldest First)",
+                                    "📅 Due Date (Newest First)",
+                                    "▼ Biggest Grade Drag (Worst First)",
+                                    "🚀 Highest Recovery Potential",
+                                ],
+                                key=f"gb_sort_{sid}_{active_cid}"
+                            )
 
                         if gb_filter == "Graded Items (Contributing)":
-                            display_rows = graded_rows
+                            display_rows = list(graded_rows)
                         elif gb_filter == "Incomplete Only":
                             display_rows = [
                                 r for r in rows
                                 if r.get("status") in ["MISSING", "NO GRADE", "UNGRADED", "UPCOMING"]
                             ]
                         else:
-                            display_rows = rows
+                            display_rows = list(rows)
+
+                        # Apply sorting
+                        if gb_sort == "📅 Due Date (Newest First)":
+                            display_rows.sort(key=lambda r: parse_date(r.get("due_raw")), reverse=True)
+                        elif gb_sort == "▼ Biggest Grade Drag (Worst First)":
+                            display_rows.sort(
+                                key=lambda r: (
+                                    0 if (r.get("grade_drag") is not None and r["grade_drag"] < 0) else (1 if r.get("grade_drag") is not None else 2),
+                                    r.get("grade_drag") if r.get("grade_drag") is not None else 999
+                                )
+                            )
+                        elif gb_sort == "🚀 Highest Recovery Potential":
+                            display_rows.sort(
+                                key=lambda r: (
+                                    0 if (r.get("potential_gain") is not None and r["potential_gain"] > 0) else 1,
+                                    -(r.get("potential_gain") or 0.0)
+                                )
+                            )
+                        else:
+                            display_rows.sort(key=lambda r: parse_date(r.get("due_raw")))
+
+                        # What-If Overrides state management
+                        sim_key = f"whatif_overrides_{sid}_{active_cid}"
+                        reset_cnt_key = f"sim_reset_counter_{sid}_{active_cid}"
+                        reset_counter = st.session_state.setdefault(reset_cnt_key, 0)
+                        overrides = st.session_state.setdefault(sim_key, {})
+
+                        def get_impact_display(r):
+                            drag = r.get("grade_drag")
+                            if drag is not None:
+                                if drag <= -0.005:
+                                    return f"▼ {drag:.2f}%"
+                                elif drag >= 0.005:
+                                    return f"▲ +{drag:.2f}%"
+                                else:
+                                    return "—"
+                            disp = r.get("grade_impact_display", "—")
+                            if disp:
+                                disp = disp.replace("🔺", "▲").replace("🟢", "▲").replace("🔻", "▼")
+                            return disp or "—"
 
                         if display_rows:
                             gb_df = pd.DataFrame([
                                 {
                                     "Date": r["due_str"],
                                     "Assignment": r["title"],
-                                    "Type": r["type"],
+                                    "Type": classify_assignment_type(r.get("group_name"), r.get("assignment")) or r.get("type", "—"),
                                     "Weight": r["weight_str"],
                                     "Score": r["score_str"],
-                                    "Contribution": r["contribution_str"],
+                                    "What-If Score": overrides.get(r.get("assignment_id") or r["title"], None),
+                                    "Impact": get_impact_display(r),
+                                    "Max Gain": r.get("potential_gain_str", "—"),
                                     "Status": r["status_display"],
                                     "Canvas Link": r["url"]
                                 }
@@ -1439,110 +1604,258 @@ def run_streamlit():
 
                             def style_gb_rows(row):
                                 status_val = str(row.get("Status", ""))
-                                if "MISSING" in status_val:
-                                    return ["background-color: rgba(239, 68, 68, 0.15);"] * len(row)
+                                impact_val = str(row.get("Impact", ""))
+                                whatif_val = row.get("What-If Score")
+                                if pd.notna(whatif_val) and str(whatif_val).strip() != "":
+                                    return ["background-color: rgba(59, 130, 246, 0.12); font-weight: 600;"] * len(row)
+                                elif "MISSING" in status_val:
+                                    return ["background-color: rgba(239, 68, 68, 0.18); font-weight: 600;"] * len(row)
+                                elif "▼" in impact_val:
+                                    return ["background-color: rgba(239, 68, 68, 0.08);"] * len(row)
+                                elif "▲" in impact_val:
+                                    return ["background-color: rgba(34, 197, 94, 0.06);"] * len(row)
                                 elif "Pending Review" in status_val:
                                     return ["background-color: rgba(234, 179, 8, 0.15);"] * len(row)
                                 return [""] * len(row)
 
-                            styled_gb_df = gb_df.style.apply(style_gb_rows, axis=1)
+                            def style_impact_cells(val):
+                                s = str(val)
+                                if "▲" in s:
+                                    return "color: #16a34a; font-weight: 700;"
+                                elif "▼" in s:
+                                    return "color: #dc2626; font-weight: 700;"
+                                return ""
+
+                            styled_gb_df = gb_df.style.apply(style_gb_rows, axis=1).map(style_impact_cells, subset=["Impact"])
 
                             gb_height = max(120, (len(gb_df) + 1) * 36 + 10)
-                            st.dataframe(
+                            edited_df = st.data_editor(
                                 styled_gb_df,
                                 width="stretch",
                                 height=gb_height,
                                 hide_index=True,
+                                key=f"gb_editor_{sid}_{active_cid}_{reset_counter}",
+                                disabled=[c for c in gb_df.columns if c != "What-If Score"],
                                 column_config={
                                     "Canvas Link": st.column_config.LinkColumn("Canvas Link", display_text="Open in Canvas"),
                                     "Weight": st.column_config.TextColumn(
                                         "Weight",
                                         help="Weight of this assignment or category toward the final grade"
                                     ),
-                                    "Contribution": st.column_config.TextColumn(
-                                        "Contribution",
-                                        help="Points or percentage this item contributes toward your final grade (Score % × Weight)"
-                                    ),
                                     "Score": st.column_config.TextColumn("Score"),
+                                    "What-If Score": st.column_config.NumberColumn(
+                                        "What-If Score",
+                                        help="Enter a hypothetical score to simulate overall course grade below",
+                                        min_value=0.0,
+                                        step=1.0,
+                                    ),
+                                    "Impact": st.column_config.TextColumn(
+                                        "Impact",
+                                        help="Current net drag or boost this assignment has on the overall course grade compared to if it were excused."
+                                    ),
+                                    "Max Gain": st.column_config.TextColumn(
+                                        "Max Gain",
+                                        help="Potential percentage points gained if this assignment is retaken or completed for 100% full credit."
+                                    ),
                                     "Status": st.column_config.TextColumn("Status"),
                                 }
                             )
+
+                            # Synchronize What-If overrides from edited DataFrame
+                            for idx, ed_row in edited_df.iterrows():
+                                if idx < len(display_rows):
+                                    orig_r = display_rows[idx]
+                                    aid = orig_r.get("assignment_id") or orig_r["title"]
+                                    val = ed_row.get("What-If Score")
+                                    if pd.notna(val) and str(val).strip() != "":
+                                        fval = float(val)
+                                        if overrides.get(aid) != fval:
+                                            overrides[aid] = fval
+                                    elif aid in overrides and (pd.isna(val) or str(val).strip() == ""):
+                                        del overrides[aid]
+
+                            # Underneath table: Simulated Grade Banner & Reset
+                            if overrides and computed_overall is not None:
+                                sim_grade = simulate_course_grade(
+                                    rows, weighted, gb_data.get("group_weights"), score_overrides=overrides
+                                )
+                                if sim_grade is not None:
+                                    delta = sim_grade - computed_overall
+                                    with st.container(border=True):
+                                        sim_c1, sim_c2, sim_c3, sim_c4 = st.columns([1.2, 1.2, 2.2, 1.2])
+                                        sim_c1.metric("Official Grade", active_course_info["grade_str"])
+                                        sim_c2.metric("Simulated Grade", f"{sim_grade:.2f}%", delta=f"{delta:+.2f}%")
+                                        delta_color = "green" if delta > 0 else ("red" if delta < 0 else "blue")
+                                        delta_sign = "+" if delta > 0 else ""
+                                        sim_c3.markdown(
+                                            f"**Simulated Impact:** :{delta_color}[**{delta_sign}{delta:.2f}%** overall grade change]<br>"
+                                            f"<span style='color: #64748b; font-size: 0.88em;'>Active simulation on {len(overrides)} assignment(s)</span>",
+                                            unsafe_allow_html=True
+                                        )
+                                        with sim_c4:
+                                            st.write("")
+                                            if st.button("🔄 Reset What-If", key=f"btn_reset_sim_table_{sid}_{active_cid}", help="Clear all hypothetical scores in table"):
+                                                st.session_state[reset_cnt_key] = reset_counter + 1
+                                                st.session_state[sim_key] = {}
+                                                st.rerun()
+                            else:
+                                st.caption("💡 *Tip: Enter a score in any assignment's **What-If Score** column above to simulate its effect on your course grade in real time.*")
                         else:
                             if gb_filter == "Graded Items (Contributing)" and not graded_rows:
                                 st.info(f"ℹ️ No graded items recorded yet for {cname}. (Total assignments in course: {len(rows)}). Switch to **'All Items'** to view upcoming assignments.")
                             else:
                                 st.info("No assignments match the selected filter.")
 
+                        # -----------------------------------------------------------
+                        # 2. Category Health & Weight Breakdown (Compressed Table at Bottom)
+                        # -----------------------------------------------------------
+                        cat_health = gb_data.get("category_health") or []
+                        if cat_health:
+                            st.write("")
+                            st.markdown("#### 📊 Category Health & Weight Breakdown")
+                            cat_rows = []
+                            for ch in cat_health:
+                                ch_name = ch.get("name", "").lower()
+                                c_icon = "📝 " if any(k in ch_name for k in ["assess", "test", "quiz", "major", "exam", "sclt"]) else ("🏠 " if "homework" in ch_name or "hw" in ch_name else "🏫 ")
+                                wt_str = f"{ch['weight']:g}%" if weighted else "—"
+                                if ch["is_active"] and ch["score_pct"] is not None:
+                                    score_str = f"{ch['score_pct']:.1f}%"
+                                    pts_str = f"{ch['earned']:g} / {ch['possible']:g}"
+                                    items_str = f"{ch['graded_items']} graded"
+                                    drag_val = ch.get("drag_vs_overall")
+                                    if drag_val is not None:
+                                        if drag_val <= -1.0:
+                                            health_str = f"▼ {abs(drag_val):.1f}% below overall"
+                                        elif drag_val >= 1.0:
+                                            health_str = f"▲ +{drag_val:.1f}% above overall"
+                                        else:
+                                            health_str = "— On par with overall"
+                                    else:
+                                        health_str = "—"
+                                    contrib_str = f"{ch['weighted_contribution']:.2f}%" if weighted else score_str
+                                else:
+                                    score_str = "—"
+                                    pts_str = "—"
+                                    items_str = "0 graded"
+                                    health_str = "— No graded work yet"
+                                    contrib_str = "—"
+
+                                cat_rows.append({
+                                    "Category": f"{c_icon}{ch['name']}",
+                                    "Weight": wt_str,
+                                    "Category Score": score_str,
+                                    "Points Earned / Possible": pts_str,
+                                    "Graded Items": items_str,
+                                    "Health vs Overall": health_str,
+                                    "Course Contribution": contrib_str,
+                                })
+
+                            cat_df = pd.DataFrame(cat_rows)
+
+                            def style_cat_rows(row):
+                                h_val = str(row.get("Health vs Overall", ""))
+                                if "▼" in h_val:
+                                    return ["background-color: rgba(239, 68, 68, 0.08);"] * len(row)
+                                elif "▲" in h_val:
+                                    return ["background-color: rgba(34, 197, 94, 0.06);"] * len(row)
+                                return [""] * len(row)
+
+                            def style_health_cells(val):
+                                s = str(val)
+                                if "▲" in s:
+                                    return "color: #16a34a; font-weight: 700;"
+                                elif "▼" in s:
+                                    return "color: #dc2626; font-weight: 700;"
+                                return ""
+
+                            styled_cat_df = cat_df.style.apply(style_cat_rows, axis=1).map(style_health_cells, subset=["Health vs Overall"])
+                            cat_height = max(80, (len(cat_df) + 1) * 36 + 8)
+                            st.dataframe(
+                                styled_cat_df,
+                                width="stretch",
+                                height=cat_height,
+                                hide_index=True,
+                                column_config={
+                                    "Health vs Overall": st.column_config.TextColumn(
+                                        "Health vs Overall",
+                                        help="Compares category score to current overall grade. Red (▼) indicates this category is dragging down the final grade, and green (▲) indicates it is boosting it."
+                                    ),
+                                    "Course Contribution": st.column_config.TextColumn(
+                                        "Course Contribution",
+                                        help="Normalized percentage points this category contributes toward the overall course grade."
+                                    )
+                                }
+                            )
+
                 # Incomplete Assignments
-                if not grades_only:
-                    st.divider()
-                    st.subheader(f"📋 Incomplete Assignments ({len(assigns)})")
+                st.divider()
+                st.subheader(f"📋 Incomplete Assignments ({len(assigns)})")
 
-                    status_filter = st.multiselect(
-                        f"Filter by Status ({sname})",
-                        options=["MISSING", "NO GRADE", "UNGRADED", "UPCOMING"],
-                        default=["MISSING", "NO GRADE", "UNGRADED", "UPCOMING"],
-                        key=f"filter_{sid}"
-                    )
+                status_filter = st.multiselect(
+                    f"Filter by Status ({sname})",
+                    options=["MISSING", "NO GRADE", "UNGRADED", "UPCOMING"],
+                    default=["MISSING", "NO GRADE", "UNGRADED", "UPCOMING"],
+                    key=f"filter_{sid}"
+                )
 
-                    filtered_assigns = [a for a in assigns if a["status"] in status_filter]
-                    # 1) Order by due date chronologically (oldest/overdue first, undated last)
-                    filtered_assigns.sort(key=lambda x: parse_date(x["due_raw"]))
+                filtered_assigns = [a for a in assigns if a["status"] in status_filter]
+                # 1) Order by due date chronologically (oldest/overdue first, undated last)
+                filtered_assigns.sort(key=lambda x: parse_date(x["due_raw"]))
 
-                    if filtered_assigns:
-                        STATUS_ICONS = {
-                            "MISSING": "🚨 MISSING",
-                            "NO GRADE": "⚠️ NO GRADE",
-                            "UNGRADED": "📝 UNGRADED",
-                            "UPCOMING": "⏳ UPCOMING",
+                if filtered_assigns:
+                    STATUS_ICONS = {
+                        "MISSING": "🚨 MISSING",
+                        "NO GRADE": "⚠️ NO GRADE",
+                        "UNGRADED": "📝 UNGRADED",
+                        "UPCOMING": "⏳ UPCOMING",
+                    }
+
+                    # Original column order: Status, Type, Course, Assignment, Due, Points, Canvas Link
+                    assign_df = pd.DataFrame([
+                        {
+                            "Status": STATUS_ICONS.get(a["status"], a["status"]),
+                            "Type": a["type"],
+                            "Course": clean_course_name(a["course"]),
+                            "Assignment": a["title"],
+                            "Due": a["due_str"],
+                            "Points": a["points"],
+                            "Canvas Link": a["url"]
                         }
+                        for a in filtered_assigns
+                    ])
 
-                        # Original column order: Status, Type, Course, Assignment, Due, Points, Canvas Link
-                        assign_df = pd.DataFrame([
-                            {
-                                "Status": STATUS_ICONS.get(a["status"], a["status"]),
-                                "Type": a["type"],
-                                "Course": clean_course_name(a["course"]),
-                                "Assignment": a["title"],
-                                "Due": a["due_str"],
-                                "Points": a["points"],
-                                "Canvas Link": a["url"]
-                            }
-                            for a in filtered_assigns
-                        ])
+                    def style_incomplete_rows(row):
+                        status_val = str(row.get("Status", ""))
+                        if "MISSING" in status_val:
+                            return ["background-color: rgba(239, 68, 68, 0.18); font-weight: 600;"] * len(row)
+                        elif "NO GRADE" in status_val:
+                            return ["background-color: rgba(245, 158, 11, 0.12);"] * len(row)
+                        elif "UNGRADED" in status_val:
+                            return ["background-color: rgba(59, 130, 246, 0.08);"] * len(row)
+                        return [""] * len(row)
 
-                        def style_incomplete_rows(row):
-                            status_val = str(row.get("Status", ""))
-                            if "MISSING" in status_val:
-                                return ["background-color: rgba(239, 68, 68, 0.18); font-weight: 600;"] * len(row)
-                            elif "NO GRADE" in status_val:
-                                return ["background-color: rgba(245, 158, 11, 0.12);"] * len(row)
-                            elif "UNGRADED" in status_val:
-                                return ["background-color: rgba(59, 130, 246, 0.08);"] * len(row)
-                            return [""] * len(row)
+                    styled_assign_df = assign_df.style.apply(style_incomplete_rows, axis=1)
 
-                        styled_assign_df = assign_df.style.apply(style_incomplete_rows, axis=1)
+                    # 2) Expand table to full height of all rows (no scrolling in viewport)
+                    assign_table_height = max(120, (len(filtered_assigns) + 1) * 36 + 10)
 
-                        # 2) Expand table to full height of all rows (no scrolling in viewport)
-                        assign_table_height = max(120, (len(filtered_assigns) + 1) * 36 + 10)
-
-                        st.dataframe(
-                            styled_assign_df,
-                            width="stretch",
-                            height=assign_table_height,
-                            hide_index=True,
-                            column_config={
-                                "Canvas Link": st.column_config.LinkColumn("Canvas Link", display_text="Open in Canvas"),
-                                "Status": st.column_config.TextColumn("Status"),
-                            }
-                        )
-                    else:
-                        st.success("🎉 All caught up! No assignments matching the selected filters.")
+                    st.dataframe(
+                        styled_assign_df,
+                        width="stretch",
+                        height=assign_table_height,
+                        hide_index=True,
+                        column_config={
+                            "Canvas Link": st.column_config.LinkColumn("Canvas Link", display_text="Open in Canvas"),
+                            "Status": st.column_config.TextColumn("Status"),
+                        }
+                    )
+                else:
+                    st.success("🎉 All caught up! No assignments matching the selected filters.")
 
                 # Report download
                 st.divider()
-                st_html = build_student_html(sid, sname, assigns, ag_grades, grades, grades_only=grades_only)
-                downloadable_html = wrap_html_report(sname, st_html, grades_only=grades_only)
+                st_html = build_student_html(sid, sname, assigns, ag_grades, grades)
+                downloadable_html = wrap_html_report(sname, st_html)
                 d1, d2, _ = st.columns([1, 1, 3])
                 with d1:
                     st.download_button(

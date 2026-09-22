@@ -17,6 +17,9 @@ import canvas_gradebook
 from canvas_gradebook import (
     compute_contribution,
     compute_overall,
+    attach_grade_impacts,
+    compute_category_health,
+    simulate_course_grade,
     status_for,
     build_gradebook_rows,
     sort_gradebook_rows,
@@ -300,7 +303,7 @@ class TestBuildAndSortRows(unittest.TestCase):
         # Row 2 check (Excused + Omitted)
         r2 = rows[1]
         self.assertEqual(r2["title"], "Quiz 1")
-        self.assertEqual(r2["type"], "Assessment")
+        self.assertEqual(r2["type"], "Assessments")
         self.assertEqual(r2["score_str"], "Excused")
         self.assertEqual(r2["contribution_str"], "—")
         self.assertTrue(r2["omit_from_final_grade"])
@@ -327,22 +330,128 @@ class TestBuildAndSortRows(unittest.TestCase):
 
 
 class TestClassifyAssignmentType(unittest.TestCase):
-    """Test group name to assignment category classification."""
+    """Test group name to assignment category classification aligning with weight groups."""
 
     def test_classifications(self):
-        self.assertEqual(classify_assignment_type("Homework 1"), "Homework")
-        # Shared helper (canvas_tracker) only maps an exact "hw" match to Homework
-        self.assertEqual(classify_assignment_type("Weekly HW"), "Weekly HW")
+        # Directly preserves course weight group names
+        self.assertEqual(classify_assignment_type("Major Assignments"), "Major Assignments")
+        self.assertEqual(classify_assignment_type("Minor Assignments"), "Minor Assignments")
+        self.assertEqual(classify_assignment_type("Quarterly Assessments"), "Quarterly Assessments")
+        self.assertEqual(classify_assignment_type("Assessments"), "Assessments")
+        self.assertEqual(classify_assignment_type("Classwork"), "Classwork")
+        self.assertEqual(classify_assignment_type("Homework"), "Homework")
         self.assertEqual(classify_assignment_type("HW"), "Homework")
-        self.assertEqual(classify_assignment_type("Unit 1 Assessment"), "Assessment")
-        self.assertEqual(classify_assignment_type("Chapter Test"), "Assessment")
-        self.assertEqual(classify_assignment_type("Pop Quiz"), "Assessment")
-        self.assertEqual(classify_assignment_type("Quarterly Exam"), "Assessment")
-        self.assertEqual(classify_assignment_type("SCLT 2"), "Assessment")
-        self.assertEqual(classify_assignment_type("Classwork 3"), "Class Assignment")
-        self.assertEqual(classify_assignment_type("Lab Practice"), "Class Assignment")
         self.assertEqual(classify_assignment_type(""), "Class Assignment")
-        self.assertEqual(classify_assignment_type("Project Presentation"), "Project Presentation")
+        self.assertEqual(classify_assignment_type(None), "Class Assignment")
+
+        # Handles ungraded detection
+        self.assertEqual(classify_assignment_type("Ungraded"), "Ungraded")
+        self.assertEqual(classify_assignment_type("Not Graded"), "Ungraded")
+        self.assertEqual(classify_assignment_type("Non-Graded"), "Ungraded")
+        self.assertEqual(classify_assignment_type("Major Assignments", {"grading_type": "not_graded"}), "Ungraded")
+        self.assertEqual(classify_assignment_type("Minor Assignments", {"submission_types": ["not_graded"]}), "Ungraded")
+        self.assertEqual(classify_assignment_type(None, {"points_possible": 0}), "Ungraded")
+
+
+class TestAttachGradeImpacts(unittest.TestCase):
+    """Test grade drag and potential recovery calculations."""
+
+    def test_weighted_drag_and_gain(self):
+        # Group 1 (wt 60): Test 1 (30/50), Test 2 (45/50) -> total 75/100 (75%)
+        # Group 2 (wt 40): HW 1 (10/10), HW 2 (10/10) -> total 20/20 (100%)
+        # Overall grade = 60 * 0.75 + 40 * 1.0 = 85.0%
+        rows = [
+            {"assignment_id": 1, "group_id": 1, "group_weight": 60.0, "score": 30.0, "points_possible": 50.0},
+            {"assignment_id": 2, "group_id": 1, "group_weight": 60.0, "score": 45.0, "points_possible": 50.0},
+            {"assignment_id": 3, "group_id": 2, "group_weight": 40.0, "score": 10.0, "points_possible": 10.0},
+            {"assignment_id": 4, "group_id": 2, "group_weight": 40.0, "score": 10.0, "points_possible": 10.0},
+        ]
+        group_weights = {1: 60.0, 2: 40.0}
+        attach_grade_impacts(rows, weighted=True, group_weights=group_weights)
+
+        # Test 1 (30/50) was dragging down the grade:
+        # Without Test 1: Test group has 45/50 = 90%. Grade = 60 * 0.9 + 40 * 1.0 = 94.0%.
+        # Drag = 85.0 - 94.0 = -9.0%
+        self.assertAlmostEqual(rows[0]["grade_drag"], -9.0)
+        self.assertEqual(rows[0]["grade_drag_str"], "-9.00%")
+        self.assertIn("▼", rows[0]["grade_impact_display"])
+        # Potential gain if full credit (50/50):
+        # Test group would be 95/100 = 95%. Grade = 60 * 0.95 + 40 = 97.0%.
+        # Potential gain = 97.0 - 85.0 = +12.0%
+        self.assertAlmostEqual(rows[0]["potential_gain"], 12.0)
+        self.assertEqual(rows[0]["potential_gain_str"], "+12.00%")
+
+        # Test 2 (45/50 = 90%) was boosting the grade compared to without it:
+        # Without Test 2: Test group is 30/50 = 60%. Grade = 60 * 0.6 + 40 = 76.0%.
+        # Drag/boost = 85.0 - 76.0 = +9.0%
+        self.assertAlmostEqual(rows[1]["grade_drag"], 9.0)
+        self.assertEqual(rows[1]["grade_drag_str"], "+9.00%")
+        self.assertIn("▲", rows[1]["grade_impact_display"])
+
+        # Perfect HW 1 (10/10): potential gain is 0
+        self.assertAlmostEqual(rows[2]["potential_gain"], 0.0)
+
+    def test_unweighted_drag_and_gain(self):
+        # 3 assignments: 10/10, 10/10, 0/20 -> total 20/40 = 50.0%
+        rows = [
+            {"assignment_id": 1, "score": 10.0, "points_possible": 10.0},
+            {"assignment_id": 2, "score": 10.0, "points_possible": 10.0},
+            {"assignment_id": 3, "score": 0.0, "points_possible": 20.0},
+        ]
+        attach_grade_impacts(rows, weighted=False)
+        # Without the 0/20 item: 20/20 = 100.0%.
+        # Drag = 50.0 - 100.0 = -50.0%
+        self.assertAlmostEqual(rows[2]["grade_drag"], -50.0)
+        # Potential gain if 20/20: total 40/40 = 100.0% -> +50.0%
+        self.assertAlmostEqual(rows[2]["potential_gain"], 50.0)
+
+
+class TestComputeCategoryHealth(unittest.TestCase):
+    """Test category breakdown aggregation and health metrics."""
+
+    def test_category_health_aggregation(self):
+        rows = [
+            {"group_id": 1, "group_name": "Assessments", "group_weight": 60.0, "score": 35.0, "points_possible": 50.0, "status": "GRADED"},
+            {"group_id": 2, "group_name": "Homework", "group_weight": 40.0, "score": 20.0, "points_possible": 20.0, "status": "GRADED"},
+        ]
+        group_weights = {1: 60.0, 2: 40.0}
+        groups_by_id = {
+            1: {"name": "Assessments", "group_weight": 60.0},
+            2: {"name": "Homework", "group_weight": 40.0},
+            3: {"name": "Quarterly Exam", "group_weight": 10.0},  # Inactive group
+        }
+        cats = compute_category_health(rows, weighted=True, group_weights=group_weights, groups_by_id=groups_by_id)
+        
+        # Overall grade: 60 * 0.70 + 40 * 1.0 = 42 + 40 = 82.0%
+        self.assertEqual(len(cats), 3)
+        assess = next(c for c in cats if c["group_id"] == 1)
+        self.assertEqual(assess["name"], "Assessments")
+        self.assertAlmostEqual(assess["score_pct"], 70.0)
+        self.assertTrue(assess["is_active"])
+        # Drag vs overall: 70.0 - 82.0 = -12.0%
+        self.assertAlmostEqual(assess["drag_vs_overall"], -12.0)
+
+        inactive = next(c for c in cats if c["group_id"] == 3)
+        self.assertFalse(inactive["is_active"])
+        self.assertIsNone(inactive["score_pct"])
+
+
+class TestSimulateCourseGrade(unittest.TestCase):
+    """Test what-if grade simulation."""
+
+    def test_simulation_override(self):
+        rows = [
+            {"assignment_id": 101, "group_id": 1, "group_weight": 50.0, "score": 25.0, "points_possible": 50.0},
+            {"assignment_id": 102, "group_id": 2, "group_weight": 50.0, "score": 50.0, "points_possible": 50.0},
+        ]
+        group_weights = {1: 50.0, 2: 50.0}
+        # Initial: 50 * 0.5 + 50 * 1.0 = 75.0%
+        initial = simulate_course_grade(rows, weighted=True, group_weights=group_weights)
+        self.assertAlmostEqual(initial, 75.0)
+
+        # Retake assignment 101 to 45/50 (90%) -> 50 * 0.9 + 50 = 95.0%
+        simulated = simulate_course_grade(rows, weighted=True, group_weights=group_weights, score_overrides={101: 45.0})
+        self.assertAlmostEqual(simulated, 95.0)
 
 
 class TestModuleImport(unittest.TestCase):
@@ -351,6 +460,9 @@ class TestModuleImport(unittest.TestCase):
     def test_imports(self):
         self.assertTrue(callable(canvas_gradebook.compute_contribution))
         self.assertTrue(callable(canvas_gradebook.compute_overall))
+        self.assertTrue(callable(canvas_gradebook.attach_grade_impacts))
+        self.assertTrue(callable(canvas_gradebook.compute_category_health))
+        self.assertTrue(callable(canvas_gradebook.simulate_course_grade))
         self.assertTrue(callable(canvas_gradebook.status_for))
         self.assertTrue(callable(canvas_gradebook.build_gradebook_rows))
         self.assertTrue(callable(canvas_gradebook.sort_gradebook_rows))
