@@ -56,6 +56,12 @@ DEFAULT_CONFIG = {
         "active_hours_start": "06:00",
         "active_hours_end": "20:00",
     },
+    "notes": {
+        "backend": "local",
+        "filepath": "canvas_notes.json",
+        "google_sheet_url": "",
+        "google_sheet_secret": "",
+    },
 }
 
 
@@ -99,7 +105,7 @@ def load_config(config_path: str = None) -> dict:
         try:
             with open(target_file, "rb") as f:
                 file_cfg = tomllib.load(f)
-                for section in ["canvas", "refresh"]:
+                for section in ["canvas", "refresh", "notes"]:
                     if section in file_cfg and isinstance(file_cfg[section], dict):
                         config[section].update(file_cfg[section])
         except Exception as e:
@@ -119,6 +125,12 @@ def load_config(config_path: str = None) -> dict:
         config["refresh"]["active_hours_start"] = os.getenv("CANVAS_ACTIVE_HOURS_START")
     if os.getenv("CANVAS_ACTIVE_HOURS_END"):
         config["refresh"]["active_hours_end"] = os.getenv("CANVAS_ACTIVE_HOURS_END")
+    if os.getenv("CANVAS_NOTES_BACKEND"):
+        config["notes"]["backend"] = os.getenv("CANVAS_NOTES_BACKEND")
+    if os.getenv("CANVAS_GOOGLE_SHEET_URL"):
+        config["notes"]["google_sheet_url"] = os.getenv("CANVAS_GOOGLE_SHEET_URL")
+    if os.getenv("CANVAS_GOOGLE_SHEET_SECRET"):
+        config["notes"]["google_sheet_secret"] = os.getenv("CANVAS_GOOGLE_SHEET_SECRET")
 
     config["canvas"]["base_url"] = config["canvas"]["base_url"].rstrip("/")
     return config
@@ -208,7 +220,7 @@ def parse_date(date_str):
         return datetime.max.replace(tzinfo=timezone.utc)
 
 
-def classify_assignment_type(group_name, assignment=None):
+def classify_assignment_type(group_name, assignment=None, *args, **kwargs):
     """Classify the assignment type to align directly with the course's weight groups
     (assignment groups), while properly identifying special categories like 'Ungraded'.
     """
@@ -489,6 +501,9 @@ def fetch_course_gradebook(base_url: str, token: str, course_id: int, student_id
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
 
+    import importlib
+    import canvas_gradebook
+    importlib.reload(canvas_gradebook)
     from canvas_gradebook import (
         build_gradebook_rows,
         sort_gradebook_rows,
@@ -750,6 +765,7 @@ def collect_canvas_data(base_url: str = None, token: str = None, grades_only: bo
                 status = "UPCOMING"
 
             student_assignments[user_id].append({
+                "assignment_id": assignment.get("id"),
                 "course": course_name,
                 "title": assignment.get("name", "Untitled"),
                 "due_raw": due_at,
@@ -1039,12 +1055,17 @@ def run_streamlit():
     import streamlit as st
     import streamlit.components.v1 as components
     import pandas as pd
+    import canvas_notes
+    import importlib
+    importlib.reload(canvas_notes)
+    from canvas_notes import get_notes_backend, GOOGLE_APPS_SCRIPT_TEMPLATE
 
     st.set_page_config(page_title="Canvas Student Tracker", page_icon="🎓", layout="wide")
 
     config = load_config()
     canvas_cfg = config["canvas"]
     refresh_cfg = config["refresh"]
+    notes_cfg = config.get("notes", {})
 
     st.sidebar.title("🎓 Canvas Tracker")
 
@@ -1078,6 +1099,85 @@ def run_streamlit():
             st.session_state["cached_gradebooks"].clear()
         st.cache_data.clear()
         st.rerun()
+
+    # Notes & Storage Configuration
+    st.sidebar.divider()
+    with st.sidebar.expander("📝 Notes & Storage", expanded=False):
+        default_backend_idx = 1 if notes_cfg.get("backend") == "google_sheet" else 0
+        selected_backend_mode = st.radio(
+            "Storage Backend",
+            options=["Local File (canvas_notes.json)", "Google Sheet Sync"],
+            index=default_backend_idx,
+            key="notes_backend_mode_radio",
+            help="Choose where assignment notes are saved and synced."
+        )
+
+        backend_type = "google_sheet" if "Google" in selected_backend_mode else "local"
+        notes_cfg["backend"] = backend_type
+
+        if backend_type == "local":
+            st.caption("Notes are saved locally to `canvas_notes.json` in the project root. Zero setup required.")
+            local_backend = get_notes_backend({"notes": {"backend": "local", "filepath": notes_cfg.get("filepath", "canvas_notes.json")}})
+            valid, msg = local_backend.validate()
+            if valid:
+                all_local = local_backend.load_all_notes()
+                st.caption(f"Status: Ready ({len(all_local)} note(s) stored)")
+            else:
+                st.warning(f"Status: {msg}")
+            notes_backend = local_backend
+        else:
+            gs_url = st.text_input(
+                "Apps Script Web App URL",
+                value=notes_cfg.get("google_sheet_url", ""),
+                placeholder="https://script.google.com/macros/s/.../exec",
+                key="gs_url_input",
+                help="The deployed Web App URL from Google Apps Script."
+            )
+            gs_secret = st.text_input(
+                "Secret Key (Optional)",
+                value=notes_cfg.get("google_sheet_secret", ""),
+                type="password",
+                key="gs_secret_input",
+                help="The SECRET_KEY set in your Google Apps Script, if configured."
+            )
+            notes_cfg["google_sheet_url"] = gs_url
+            notes_cfg["google_sheet_secret"] = gs_secret
+            gs_backend = get_notes_backend({"notes": notes_cfg})
+
+            col_test, col_export = st.columns(2)
+            with col_test:
+                if st.button("🧪 Test Connection", key="btn_test_gs"):
+                    with st.spinner("Pinging Web App..."):
+                        ok, msg = gs_backend.validate()
+                        if ok:
+                            st.success("✅ Connected!")
+                        else:
+                            st.error(f"❌ {msg}")
+            with col_export:
+                if st.button("⬆️ Export Local", key="btn_export_local_to_gs", help="Copy notes from local canvas_notes.json into Google Sheet"):
+                    local_backend = get_notes_backend({"notes": {"backend": "local"}})
+                    count = local_backend.export_to(gs_backend)
+                    st.success(f"Exported {count} notes to sheet!")
+
+            with st.expander("📋 Google Sheet Setup Guide", expanded=False):
+                st.markdown("""
+**How to set up Google Sheet Notes Sync:**
+1. Open a new Google Sheet in your Google Drive.
+2. Go to **Extensions** → **Apps Script**.
+3. Replace all code in the script editor with the snippet below.
+4. *(Optional)* Set `SECRET_KEY = "your-passphrase"`.
+5. Click **Deploy** → **New deployment**:
+   - Type: **Web app**
+   - Execute as: **Me**
+   - Who has access: **Anyone**
+6. Click Deploy, authorize access, and copy the Web App URL.
+7. Paste the URL into the input above and click **Test Connection**!
+""")
+                st.code(GOOGLE_APPS_SCRIPT_TEMPLATE, language="javascript")
+
+            notes_backend = gs_backend
+
+        st.session_state["notes_backend"] = notes_backend
 
     if not token:
         st.warning("⚠️ Please provide a Canvas API Token in the sidebar, a `.env` file, or `~/.config/canvas_tracker/config.toml`.")
@@ -1129,6 +1229,7 @@ def run_streamlit():
         student_group_grades = data["student_group_grades"]
         student_assignments = data["student_assignments"]
         fetched_at = data.get("fetched_at", datetime.now())
+        notes_backend = st.session_state.get("notes_backend") or get_notes_backend(config)
 
         if not observees:
             st.warning("No observed students found on this Canvas account.")
@@ -1585,6 +1686,29 @@ def run_streamlit():
                                 disp = disp.replace("🔺", "▲").replace("🟢", "▲").replace("🔻", "▼")
                             return disp or "—"
 
+                        # Check if a copy button was clicked in Detailed Gradebook
+                        gb_copy_click = st.session_state.get(f"btn_copy_gb_{sid}_{active_cid}_{reset_counter}")
+                        if gb_copy_click:
+                            r_idx = getattr(gb_copy_click, "row", None) if not isinstance(gb_copy_click, dict) else gb_copy_click.get("row")
+                            if r_idx is not None and 0 <= r_idx < len(display_rows):
+                                t_row = display_rows[r_idx]
+                                st.session_state["active_copied_link"] = {
+                                    "title": t_row["title"],
+                                    "url": t_row.get("url", "")
+                                }
+
+                        active_copied = st.session_state.get("active_copied_link")
+                        if active_copied and active_copied.get("url"):
+                            with st.container(border=True):
+                                c_c1, c_c2 = st.columns([5, 1])
+                                c_c1.markdown(f"📋 **Canvas Link for [{active_copied['title']}]({active_copied['url']})** (Click clipboard icon in code block to copy):")
+                                c_c1.code(active_copied["url"], language=None)
+                                with c_c2:
+                                    st.write("")
+                                    if st.button("✕ Dismiss", key=f"dismiss_copy_gb_{sid}_{active_cid}"):
+                                        st.session_state.pop("active_copied_link", None)
+                                        st.rerun()
+
                         if display_rows:
                             gb_df = pd.DataFrame([
                                 {
@@ -1597,7 +1721,9 @@ def run_streamlit():
                                     "Impact": get_impact_display(r),
                                     "Max Gain": r.get("potential_gain_str", "—"),
                                     "Status": r["status_display"],
-                                    "Canvas Link": r["url"]
+                                    "Notes": notes_backend.get_note(r.get("assignment_id") or r["title"]),
+                                    "Canvas Link": r["url"],
+                                    "Copy": "📋 Copy"
                                 }
                                 for r in display_rows
                             ])
@@ -1635,9 +1761,15 @@ def run_streamlit():
                                 height=gb_height,
                                 hide_index=True,
                                 key=f"gb_editor_{sid}_{active_cid}_{reset_counter}",
-                                disabled=[c for c in gb_df.columns if c != "What-If Score"],
+                                disabled=[c for c in gb_df.columns if c not in ("What-If Score", "Notes")],
                                 column_config={
                                     "Canvas Link": st.column_config.LinkColumn("Canvas Link", display_text="Open in Canvas"),
+                                    "Copy": st.column_config.ButtonColumn(
+                                        "Copy",
+                                        help="Click to reveal 1-click copyable link",
+                                        type="tertiary",
+                                        key=f"btn_copy_gb_{sid}_{active_cid}_{reset_counter}"
+                                    ),
                                     "Weight": st.column_config.TextColumn(
                                         "Weight",
                                         help="Weight of this assignment or category toward the final grade"
@@ -1658,10 +1790,15 @@ def run_streamlit():
                                         help="Potential percentage points gained if this assignment is retaken or completed for 100% full credit."
                                     ),
                                     "Status": st.column_config.TextColumn("Status"),
+                                    "Notes": st.column_config.TextColumn(
+                                        "Notes",
+                                        help="Double-click cell to view or edit notes. Press Enter to save.",
+                                        max_chars=1000,
+                                    ),
                                 }
                             )
 
-                            # Synchronize What-If overrides from edited DataFrame
+                            # Synchronize What-If overrides & Notes from edited DataFrame
                             for idx, ed_row in edited_df.iterrows():
                                 if idx < len(display_rows):
                                     orig_r = display_rows[idx]
@@ -1673,6 +1810,12 @@ def run_streamlit():
                                             overrides[aid] = fval
                                     elif aid in overrides and (pd.isna(val) or str(val).strip() == ""):
                                         del overrides[aid]
+
+                                    val_note = str(ed_row.get("Notes") or "").strip()
+                                    curr_note = notes_backend.get_note(aid)
+                                    if val_note != curr_note:
+                                        notes_backend.save_note(aid, val_note)
+                                        st.toast(f"💾 Saved note for '{orig_r['title']}'")
 
                             # Underneath table: Simulated Grade Banner & Reset
                             if overrides and computed_overall is not None:
@@ -1810,7 +1953,30 @@ def run_streamlit():
                         "UPCOMING": "⏳ UPCOMING",
                     }
 
-                    # Original column order: Status, Type, Course, Assignment, Due, Points, Canvas Link
+                    # Check if a copy button was clicked in Incomplete Assignments
+                    inc_copy_click = st.session_state.get(f"btn_copy_inc_{sid}")
+                    if inc_copy_click:
+                        r_idx = getattr(inc_copy_click, "row", None) if not isinstance(inc_copy_click, dict) else inc_copy_click.get("row")
+                        if r_idx is not None and 0 <= r_idx < len(filtered_assigns):
+                            t_assign = filtered_assigns[r_idx]
+                            st.session_state["active_copied_link"] = {
+                                "title": t_assign["title"],
+                                "url": t_assign.get("url", "")
+                            }
+
+                    active_copied_inc = st.session_state.get("active_copied_link")
+                    if active_copied_inc and active_copied_inc.get("url"):
+                        with st.container(border=True):
+                            c_c1, c_c2 = st.columns([5, 1])
+                            c_c1.markdown(f"📋 **Canvas Link for [{active_copied_inc['title']}]({active_copied_inc['url']})** (Click clipboard icon in code block to copy):")
+                            c_c1.code(active_copied_inc["url"], language=None)
+                            with c_c2:
+                                st.write("")
+                                if st.button("✕ Dismiss", key=f"dismiss_copy_inc_{sid}"):
+                                    st.session_state.pop("active_copied_link", None)
+                                    st.rerun()
+
+                    # Columns: Status, Type, Course, Assignment, Due, Points, Notes, Canvas Link, Copy
                     assign_df = pd.DataFrame([
                         {
                             "Status": STATUS_ICONS.get(a["status"], a["status"]),
@@ -1819,7 +1985,9 @@ def run_streamlit():
                             "Assignment": a["title"],
                             "Due": a["due_str"],
                             "Points": a["points"],
-                            "Canvas Link": a["url"]
+                            "Notes": notes_backend.get_note(a.get("assignment_id") or a["title"]),
+                            "Canvas Link": a["url"],
+                            "Copy": "📋 Copy"
                         }
                         for a in filtered_assigns
                     ])
@@ -1839,16 +2007,40 @@ def run_streamlit():
                     # 2) Expand table to full height of all rows (no scrolling in viewport)
                     assign_table_height = max(120, (len(filtered_assigns) + 1) * 36 + 10)
 
-                    st.dataframe(
+                    edited_assign_df = st.data_editor(
                         styled_assign_df,
                         width="stretch",
                         height=assign_table_height,
                         hide_index=True,
+                        key=f"inc_editor_{sid}",
+                        disabled=[c for c in assign_df.columns if c != "Notes"],
                         column_config={
                             "Canvas Link": st.column_config.LinkColumn("Canvas Link", display_text="Open in Canvas"),
+                            "Copy": st.column_config.ButtonColumn(
+                                "Copy",
+                                help="Click to reveal 1-click copyable link",
+                                type="tertiary",
+                                key=f"btn_copy_inc_{sid}"
+                            ),
                             "Status": st.column_config.TextColumn("Status"),
+                            "Notes": st.column_config.TextColumn(
+                                "Notes",
+                                help="Double-click cell to view or edit notes. Press Enter to save.",
+                                max_chars=1000,
+                            ),
                         }
                     )
+
+                    # Synchronize Notes from edited DataFrame
+                    for idx, ed_row in edited_assign_df.iterrows():
+                        if idx < len(filtered_assigns):
+                            orig_a = filtered_assigns[idx]
+                            aid = orig_a.get("assignment_id") or orig_a["title"]
+                            val_note = str(ed_row.get("Notes") or "").strip()
+                            curr_note = notes_backend.get_note(aid)
+                            if val_note != curr_note:
+                                notes_backend.save_note(aid, val_note)
+                                st.toast(f"💾 Saved note for '{orig_a['title']}'")
                 else:
                     st.success("🎉 All caught up! No assignments matching the selected filters.")
 

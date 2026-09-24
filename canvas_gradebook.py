@@ -31,7 +31,6 @@ from canvas_tracker import (
     fetch_all,
     format_date,
     parse_date,
-    classify_assignment_type,
     load_config,
 )
 
@@ -43,6 +42,32 @@ CANVAS_API_TOKEN = os.getenv("CANVAS_API_TOKEN") or _config["canvas"]["api_token
 # ---------------------------------------------------------------------------
 # Pure Calculation & Classification Functions (Network-Free)
 # ---------------------------------------------------------------------------
+
+def classify_assignment_type(group_name, assignment=None, *args, **kwargs):
+    """Classify the assignment type to align directly with the course's weight groups
+    (assignment groups), while properly identifying special categories like 'Ungraded'.
+    """
+    if assignment and isinstance(assignment, dict):
+        if (
+            assignment.get("grading_type") == "not_graded"
+            or "not_graded" in (assignment.get("submission_types") or [])
+        ):
+            return "Ungraded"
+
+    if not group_name:
+        if assignment and isinstance(assignment, dict) and assignment.get("points_possible") == 0:
+            return "Ungraded"
+        return "Class Assignment"
+
+    name_clean = str(group_name).strip()
+    name_lower = name_clean.lower()
+
+    if name_lower in ["ungraded", "not graded", "non-graded"]:
+        return "Ungraded"
+    if name_lower == "hw":
+        return "Homework"
+
+    return name_clean
 
 def compute_contribution(score, points_possible, group_weight, weighted):
     """

@@ -21,6 +21,8 @@ venv.bak/
 config.toml
 !config.toml.example
 .streamlit/secrets.toml
+canvas_notes.json
+*.notes.json
 
 # Build & packaging artifacts (portable bundle build)
 bundle/
