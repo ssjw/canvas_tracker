@@ -12,10 +12,10 @@ echo "=================================================="
 echo "Starting local web dashboard in your browser..."
 
 # Detect portable python or local virtual environment
-if [ -f "./python/bin/streamlit" ]; then
-    ./python/bin/streamlit run canvas_tracker.py --server.headless=false
-elif [ -f "./python/bin/python3" ]; then
+if [ -f "./python/bin/python3" ]; then
     ./python/bin/python3 -m streamlit run canvas_tracker.py --server.headless=false
+elif [ -f "./python/bin/streamlit" ]; then
+    ./python/bin/streamlit run canvas_tracker.py --server.headless=false
 elif [ -f "./.venv/bin/streamlit" ]; then
     ./.venv/bin/streamlit run canvas_tracker.py --server.headless=false
 elif command -v streamlit >/dev/null 2>&1; then
