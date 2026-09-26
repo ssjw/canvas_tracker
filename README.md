@@ -18,9 +18,11 @@ For general users who want to run the app without installing Python, Git, or com
    Extract the downloaded `.zip` file anywhere on your computer (e.g. `Downloads`, `Desktop`, or `Applications`).
 
 3. **Launch the App**:
-   * **macOS**: Double-click **`Launch_Canvas_Tracker.command`**  
-     *(Note: On first launch, macOS Gatekeeper may prompt about an unidentified developer. Right-click the file, select **Open**, and click **Open** in the dialog).*
-   * **Windows**: Double-click **`Launch_Canvas_Tracker.bat`**
+   * **macOS**:
+     1. Double-click **`Launch_Canvas_Tracker.command`**.
+     2. If macOS Gatekeeper alerts that Apple cannot verify the developer, open **System Settings $\rightarrow$ Privacy & Security**, scroll down to the **Security** section, and click **Open Anyway** (enter your Mac password if prompted).
+     *(Tip: Alternatively, you can open Terminal once and run `xattr -dr com.apple.quarantine ~/Downloads/canvas-tracker` before double-clicking to bypass Gatekeeper entirely).*
+   * **Windows**: Double-click **`Launch_Canvas_Tracker.bat`** (if Windows SmartScreen appears, click **More info** $\rightarrow$ **Run anyway**).
 
 4. **Connect to Canvas**:
    The dashboard will automatically open in your default browser at `http://localhost:8501`. In the left sidebar:
