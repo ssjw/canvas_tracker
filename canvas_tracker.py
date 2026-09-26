@@ -22,6 +22,7 @@ if __name__ == "__main__" and "canvas_tracker" not in sys.modules:
     sys.modules["canvas_tracker"] = sys.modules[__name__]
 
 import re
+import json
 import html
 import copy
 import argparse
@@ -1051,6 +1052,53 @@ def is_streamlit_running() -> bool:
         return False
 
 
+def copy_to_clipboard_js(text: str):
+    """Inject client-side JavaScript to write text to the user's clipboard."""
+    import streamlit as st
+    js_text = json.dumps(text)
+    nonce = datetime.now().timestamp()
+    html_code = f"""
+    <!-- copy-clipboard-nonce: {nonce} -->
+    <script>
+    (function() {{
+        const text = {js_text};
+        function fallbackCopy() {{
+            try {{
+                const ta = document.createElement("textarea");
+                ta.value = text;
+                ta.style.position = "fixed";
+                ta.style.opacity = "0";
+                ta.style.left = "-9999px";
+                document.body.appendChild(ta);
+                ta.focus();
+                ta.select();
+                const res = document.execCommand("copy");
+                document.body.removeChild(ta);
+                if (res) {{
+                    console.log("[Canvas Tracker] Copied via execCommand:", text);
+                }} else {{
+                    console.warn("[Canvas Tracker] execCommand returned false");
+                }}
+            }} catch (e) {{
+                console.error("[Canvas Tracker] Fallback copy failed:", e);
+            }}
+        }}
+        if (navigator.clipboard && window.isSecureContext) {{
+            navigator.clipboard.writeText(text).then(() => {{
+                console.log("[Canvas Tracker] Copied via navigator.clipboard:", text);
+            }}).catch(err => {{
+                console.warn("[Canvas Tracker] navigator.clipboard error, trying fallback:", err);
+                fallbackCopy();
+            }});
+        }} else {{
+            fallbackCopy();
+        }}
+    }})();
+    </script>
+    """
+    st.html(html_code, unsafe_allow_javascript=True)
+
+
 def run_streamlit():
     import streamlit as st
     import streamlit.components.v1 as components
@@ -1692,22 +1740,12 @@ def run_streamlit():
                             r_idx = getattr(gb_copy_click, "row", None) if not isinstance(gb_copy_click, dict) else gb_copy_click.get("row")
                             if r_idx is not None and 0 <= r_idx < len(display_rows):
                                 t_row = display_rows[r_idx]
-                                st.session_state["active_copied_link"] = {
-                                    "title": t_row["title"],
-                                    "url": t_row.get("url", "")
-                                }
-
-                        active_copied = st.session_state.get("active_copied_link")
-                        if active_copied and active_copied.get("url"):
-                            with st.container(border=True):
-                                c_c1, c_c2 = st.columns([5, 1])
-                                c_c1.markdown(f"📋 **Canvas Link for [{active_copied['title']}]({active_copied['url']})** (Click clipboard icon in code block to copy):")
-                                c_c1.code(active_copied["url"], language=None)
-                                with c_c2:
-                                    st.write("")
-                                    if st.button("✕ Dismiss", key=f"dismiss_copy_gb_{sid}_{active_cid}"):
-                                        st.session_state.pop("active_copied_link", None)
-                                        st.rerun()
+                                url = t_row.get("url", "")
+                                if url:
+                                    copy_to_clipboard_js(url)
+                                    st.toast(f"📋 Copied Canvas link for '{t_row['title']}' to clipboard!")
+                                else:
+                                    st.toast("⚠️ No Canvas link available for this assignment.")
 
                         if display_rows:
                             gb_df = pd.DataFrame([
@@ -1722,8 +1760,7 @@ def run_streamlit():
                                     "Max Gain": r.get("potential_gain_str", "—"),
                                     "Status": r["status_display"],
                                     "Notes": notes_backend.get_note(r.get("assignment_id") or r["title"]),
-                                    "Canvas Link": r["url"],
-                                    "Copy": "📋 Copy"
+                                    "Copy": "📋 Copy" if r.get("url") else None,
                                 }
                                 for r in display_rows
                             ])
@@ -1763,10 +1800,9 @@ def run_streamlit():
                                 key=f"gb_editor_{sid}_{active_cid}_{reset_counter}",
                                 disabled=[c for c in gb_df.columns if c not in ("What-If Score", "Notes")],
                                 column_config={
-                                    "Canvas Link": st.column_config.LinkColumn("Canvas Link", display_text="Open in Canvas"),
                                     "Copy": st.column_config.ButtonColumn(
                                         "Copy",
-                                        help="Click to reveal 1-click copyable link",
+                                        help="Click to copy Canvas assignment link directly to your clipboard",
                                         type="tertiary",
                                         key=f"btn_copy_gb_{sid}_{active_cid}_{reset_counter}"
                                     ),
@@ -1959,24 +1995,14 @@ def run_streamlit():
                         r_idx = getattr(inc_copy_click, "row", None) if not isinstance(inc_copy_click, dict) else inc_copy_click.get("row")
                         if r_idx is not None and 0 <= r_idx < len(filtered_assigns):
                             t_assign = filtered_assigns[r_idx]
-                            st.session_state["active_copied_link"] = {
-                                "title": t_assign["title"],
-                                "url": t_assign.get("url", "")
-                            }
+                            url = t_assign.get("url", "")
+                            if url:
+                                copy_to_clipboard_js(url)
+                                st.toast(f"📋 Copied Canvas link for '{t_assign['title']}' to clipboard!")
+                            else:
+                                st.toast("⚠️ No Canvas link available for this assignment.")
 
-                    active_copied_inc = st.session_state.get("active_copied_link")
-                    if active_copied_inc and active_copied_inc.get("url"):
-                        with st.container(border=True):
-                            c_c1, c_c2 = st.columns([5, 1])
-                            c_c1.markdown(f"📋 **Canvas Link for [{active_copied_inc['title']}]({active_copied_inc['url']})** (Click clipboard icon in code block to copy):")
-                            c_c1.code(active_copied_inc["url"], language=None)
-                            with c_c2:
-                                st.write("")
-                                if st.button("✕ Dismiss", key=f"dismiss_copy_inc_{sid}"):
-                                    st.session_state.pop("active_copied_link", None)
-                                    st.rerun()
-
-                    # Columns: Status, Type, Course, Assignment, Due, Points, Notes, Canvas Link, Copy
+                    # Columns: Status, Type, Course, Assignment, Due, Points, Notes, Copy
                     assign_df = pd.DataFrame([
                         {
                             "Status": STATUS_ICONS.get(a["status"], a["status"]),
@@ -1986,8 +2012,7 @@ def run_streamlit():
                             "Due": a["due_str"],
                             "Points": a["points"],
                             "Notes": notes_backend.get_note(a.get("assignment_id") or a["title"]),
-                            "Canvas Link": a["url"],
-                            "Copy": "📋 Copy"
+                            "Copy": "📋 Copy" if a.get("url") else None,
                         }
                         for a in filtered_assigns
                     ])
@@ -2015,10 +2040,9 @@ def run_streamlit():
                         key=f"inc_editor_{sid}",
                         disabled=[c for c in assign_df.columns if c != "Notes"],
                         column_config={
-                            "Canvas Link": st.column_config.LinkColumn("Canvas Link", display_text="Open in Canvas"),
                             "Copy": st.column_config.ButtonColumn(
                                 "Copy",
-                                help="Click to reveal 1-click copyable link",
+                                help="Click to copy Canvas assignment link directly to your clipboard",
                                 type="tertiary",
                                 key=f"btn_copy_inc_{sid}"
                             ),
