@@ -38,6 +38,7 @@ jobs:
           Copy-Item -Path "Launch_Canvas_Tracker.bat" -Destination "bundle/canvas-tracker/"
           Copy-Item -Path "canvas_tracker.py" -Destination "bundle/canvas-tracker/"
           Copy-Item -Path "canvas_gradebook.py" -Destination "bundle/canvas-tracker/"
+          Copy-Item -Path "canvas_notes.py" -Destination "bundle/canvas-tracker/"
           Copy-Item -Path "README.md" -Destination "bundle/canvas-tracker/"
           Copy-Item -Path "requirements.txt" -Destination "bundle/canvas-tracker/"
           Compress-Archive -Path "bundle/canvas-tracker" -DestinationPath "canvas-tracker-windows-x64.zip"
@@ -72,6 +73,7 @@ jobs:
           cp Launch_Canvas_Tracker.command bundle/canvas-tracker/
           cp canvas_tracker.py bundle/canvas-tracker/
           cp canvas_gradebook.py bundle/canvas-tracker/
+          cp canvas_notes.py bundle/canvas-tracker/
           cp README.md bundle/canvas-tracker/
           cp requirements.txt bundle/canvas-tracker/
           chmod +x bundle/canvas-tracker/Launch_Canvas_Tracker.command
@@ -108,6 +110,7 @@ jobs:
           cp Launch_Canvas_Tracker.command bundle/canvas-tracker/
           cp canvas_tracker.py bundle/canvas-tracker/
           cp canvas_gradebook.py bundle/canvas-tracker/
+          cp canvas_notes.py bundle/canvas-tracker/
           cp README.md bundle/canvas-tracker/
           cp requirements.txt bundle/canvas-tracker/
           chmod +x bundle/canvas-tracker/Launch_Canvas_Tracker.command

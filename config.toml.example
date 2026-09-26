@@ -1,0 +1,19 @@
+# ---------------------------------------------------------------------------
+# Canvas Student Tracker - Configuration File Template
+# Copy this file to config.toml or ~/.config/canvas_tracker/config.toml
+# ---------------------------------------------------------------------------
+
+[canvas]
+base_url = "https://aacps.instructure.com"
+# api_token = "your_canvas_api_token_here"  # Optional here; can also be provided via .env or CANVAS_API_TOKEN
+
+[refresh]
+interval_minutes = 60
+active_hours_start = "06:00"
+active_hours_end = "20:00"
+
+[notes]
+backend = "local"           # Options: "local" (default) or "google_sheets"
+filepath = "canvas_notes.json"
+google_sheet_url = ""       # Web App URL if using Google Sheets sync
+google_sheet_secret = ""    # Optional auth secret for Google Sheets Web App
