@@ -28,7 +28,7 @@ import copy
 import argparse
 from datetime import datetime, timezone, time, timedelta
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from dotenv import find_dotenv, load_dotenv
 from rich.console import Console
@@ -181,10 +181,18 @@ def get_next_url(headers):
 
 
 def fetch_all(session, url, params=None):
-    """Fetch all pages of a paginated Canvas API endpoint."""
+    """Fetch all pages of a paginated Canvas API endpoint with Canvas max page size (100)."""
     results = []
     current_url = url
-    current_params = params
+    if params is None:
+        current_params = {}
+    else:
+        current_params = dict(params)
+
+    # Automatically set Canvas maximum page size (100) if not explicitly set
+    if "per_page" not in current_params and "per_page=" not in current_url:
+        current_params["per_page"] = 100
+
     while current_url:
         # Secure SSL verification is enabled by default in requests
         response = session.get(current_url, params=current_params, timeout=15)
@@ -369,11 +377,63 @@ def html_to_pdf_bytes(html_str: str) -> bytes:
 # Core Data Fetching Subroutines
 # ---------------------------------------------------------------------------
 
-def fetch_course_submissions(course, session, student_ids, base_url=None):
-    """Fetch submissions for observed students in a single course."""
+def calculate_assignment_group_grades(course_name, student_ids, submissions, ags, gp_id):
+    """Pure in-memory calculation of assessment group percentages from pre-fetched submissions and groups."""
+    target_ags = {
+        ag["id"]: ag["name"] for ag in ags
+        if isinstance(ag, dict) and any(k in str(ag.get("name", "")).lower() for k in ["test", "assessment", "sclt", "quiz"])
+    }
+    if not target_ags:
+        return []
+
+    try:
+        target_gp = int(gp_id) if gp_id is not None else None
+    except (ValueError, TypeError):
+        target_gp = gp_id
+
+    results = []
+    for sid in student_ids:
+        student_subs = [s for s in submissions if isinstance(s, dict) and s.get("user_id") == sid]
+        for ag_id, ag_name in target_ags.items():
+            score_sum = 0.0
+            possible_sum = 0.0
+            for sub in student_subs:
+                assign = sub.get("assignment", {})
+                if not isinstance(assign, dict) or assign.get("omit_from_final_grade"):
+                    continue
+
+                if assign.get("assignment_group_id") == ag_id:
+                    try:
+                        sub_gp = int(sub.get("grading_period_id")) if sub.get("grading_period_id") is not None else None
+                    except (ValueError, TypeError):
+                        sub_gp = sub.get("grading_period_id")
+
+                    if target_gp is None or sub_gp == target_gp:
+                        if sub.get("score") is not None and not sub.get("excused"):
+                            try:
+                                score_sum += float(sub["score"])
+                                possible_sum += float(assign.get("points_possible", 0.0))
+                            except (ValueError, TypeError):
+                                pass
+
+            if possible_sum > 0:
+                pct = round((score_sum / possible_sum) * 100, 2)
+                results.append({
+                    "student_id": sid,
+                    "course_name": course_name,
+                    "group_name": ag_name,
+                    "score": pct
+                })
+    return results
+
+
+def fetch_course_data(course, session, student_ids, gp_id=None, base_url=None):
+    """Fetch submissions and assignment groups once per course concurrently, returning both
+    the labeled submissions and in-memory calculated test/assessment group grades.
+    """
     base_url = base_url or CANVAS_BASE_URL
     course_id = course["id"]
-    course_name = course["name"]
+    course_name = course.get("name", "")
 
     associated_student_ids = []
     enrollments = course.get("enrollments", [])
@@ -383,120 +443,134 @@ def fetch_course_submissions(course, session, student_ids, base_url=None):
             if associated_id and associated_id in student_ids:
                 associated_student_ids.append(associated_id)
 
-    if not associated_student_ids:
-        return []
+    target_student_ids = associated_student_ids or student_ids
 
+    submissions = []
+    ags = []
     try:
-        submissions = fetch_all(
-            session,
-            f"{base_url}/api/v1/courses/{course_id}/students/submissions",
-            params={"student_ids[]": associated_student_ids, "include[]": "assignment"}
-        )
-        ag_map = {}
+        with ThreadPoolExecutor(max_workers=2) as inner_exec:
+            sub_future = inner_exec.submit(
+                fetch_all,
+                session,
+                f"{base_url}/api/v1/courses/{course_id}/students/submissions",
+                params={"student_ids[]": target_student_ids, "include[]": "assignment"}
+            )
+            ag_future = inner_exec.submit(
+                fetch_all,
+                session,
+                f"{base_url}/api/v1/courses/{course_id}/assignment_groups"
+            )
+            try:
+                submissions = sub_future.result()
+            except Exception:
+                submissions = []
+            try:
+                ags = ag_future.result()
+            except Exception:
+                ags = []
+    except Exception:
+        try:
+            submissions = fetch_all(
+                session,
+                f"{base_url}/api/v1/courses/{course_id}/students/submissions",
+                params={"student_ids[]": target_student_ids, "include[]": "assignment"}
+            )
+        except Exception:
+            submissions = []
         try:
             ags = fetch_all(session, f"{base_url}/api/v1/courses/{course_id}/assignment_groups")
-            for ag in ags:
-                if isinstance(ag, dict) and "id" in ag and "name" in ag:
-                    ag_map[ag["id"]] = ag["name"]
         except Exception:
-            pass
+            ags = []
 
-        for sub in submissions:
-            if isinstance(sub, dict):
-                assignment = sub.get("assignment")
-                if isinstance(assignment, dict):
-                    ag_id = assignment.get("assignment_group_id")
-                    if ag_id and ag_id in ag_map:
-                        assignment["assignment_group_name"] = ag_map[ag_id]
+    ag_map = {ag["id"]: ag["name"] for ag in ags if isinstance(ag, dict) and "id" in ag and "name" in ag}
+    for sub in submissions:
+        if isinstance(sub, dict):
+            assignment = sub.get("assignment")
+            if isinstance(assignment, dict):
+                ag_id = assignment.get("assignment_group_id")
+                if ag_id and ag_id in ag_map:
+                    assignment["assignment_group_name"] = ag_map[ag_id]
 
-        return [(course_name, sub) for sub in submissions]
+    course_subs = [(course_name, sub) for sub in submissions]
+    group_grades = calculate_assignment_group_grades(course_name, student_ids, submissions, ags, gp_id)
+
+    return course_subs, group_grades
+
+
+def fetch_course_submissions(course, session, student_ids, base_url=None):
+    """Fetch submissions for observed students in a single course (wrapper around fetch_course_data)."""
+    course_subs, _ = fetch_course_data(course, session, student_ids, base_url=base_url)
+    return course_subs
+
+
+def fetch_assignment_group_grades(session, course_id, course_name, student_ids, gp_id, base_url=None):
+    """Fetch assignment group grades natively using in-memory calculation from fetched course data."""
+    course = {"id": course_id, "name": course_name}
+    _, group_grades = fetch_course_data(course, session, student_ids, gp_id=gp_id, base_url=base_url)
+    return group_grades
+
+
+def fetch_single_course_enrollment(session, course_id, student_id, gp_id, base_url=None):
+    """Fetch active enrollment for a single course and student."""
+    base_url = base_url or CANVAS_BASE_URL
+    params = {"user_id": student_id}
+    if gp_id:
+        params["grading_period_id"] = gp_id
+    try:
+        enrolls = fetch_all(
+            session,
+            f"{base_url}/api/v1/courses/{course_id}/enrollments",
+            params=params
+        )
+        return [e for e in enrolls if isinstance(e, dict) and e.get("enrollment_state") == "active"]
     except Exception:
         return []
 
 
-def fetch_assignment_group_grades(session, course_id, course_name, student_ids, gp_id, base_url=None):
-    """Fetch assignment group grades natively using manual calculation."""
-    base_url = base_url or CANVAS_BASE_URL
-    try:
-        ags = fetch_all(session, f"{base_url}/api/v1/courses/{course_id}/assignment_groups")
-        target_ags = {
-            ag["id"]: ag["name"] for ag in ags
-            if isinstance(ag, dict) and any(k in ag.get("name", "").lower() for k in ["test", "assessment", "sclt", "quiz"])
-        }
-
-        if not target_ags:
-            return []
-
-        subs = []
-        for sid in student_ids:
-            try:
-                stu_subs = fetch_all(
-                    session,
-                    f"{base_url}/api/v1/courses/{course_id}/students/submissions",
-                    params={"student_ids[]": sid, "include[]": ["assignment"]}
-                )
-                subs.extend(stu_subs)
-            except Exception:
-                pass
-
-        results = []
-        for sid in student_ids:
-            student_subs = [s for s in subs if s.get("user_id") == sid]
-            for ag_id, ag_name in target_ags.items():
-                score_sum = 0.0
-                possible_sum = 0.0
-                for sub in student_subs:
-                    if not isinstance(sub, dict):
-                        continue
-                    assign = sub.get("assignment", {})
-                    if assign.get("omit_from_final_grade"):
-                        continue
-
-                    if assign.get("assignment_group_id") == ag_id:
-                        if gp_id is None or sub.get("grading_period_id") == int(gp_id):
-                            if sub.get("score") is not None and not sub.get("excused"):
-                                score_sum += float(sub["score"])
-                                possible_sum += float(assign.get("points_possible", 0.0))
-
-                if possible_sum > 0:
-                    pct = round((score_sum / possible_sum) * 100, 2)
-                    results.append({
-                        "student_id": sid,
-                        "course_name": course_name,
-                        "group_name": ag_name,
-                        "score": pct
-                    })
-        return results
-    except Exception as e:
-        import sys
-        print(f"Error calculating group grades for {course_id}: {e}", file=sys.stderr)
-        return []
-
-
 def fetch_student_enrollments(session, student_id, active_gps, base_url=None):
-    """Fetch active enrollments for a given student ID, requesting specific grading periods where active."""
+    """Fetch active enrollments for a given student ID concurrently across active grading periods."""
     base_url = base_url or CANVAS_BASE_URL
     all_enrollments = []
-    for course_id, gp_id in active_gps.items():
-        params = {"user_id": student_id}
-        if gp_id:
-            params["grading_period_id"] = gp_id
-        try:
-            enrolls = fetch_all(
-                session,
-                f"{base_url}/api/v1/courses/{course_id}/enrollments",
-                params=params
-            )
-            active_enrolls = [e for e in enrolls if e.get("enrollment_state") == "active"]
-            all_enrollments.extend(active_enrolls)
-        except Exception:
-            pass
+    if not active_gps:
+        return []
+    with ThreadPoolExecutor(max_workers=min(20, max(len(active_gps), 1))) as executor:
+        futures = [
+            executor.submit(fetch_single_course_enrollment, session, cid, student_id, gpid, base_url)
+            for cid, gpid in active_gps.items()
+        ]
+        for f in as_completed(futures):
+            try:
+                all_enrollments.extend(f.result())
+            except Exception:
+                pass
     return all_enrollments
+
+
+def fetch_active_grading_period(session, course_id, base_url, now):
+    """Fetch and identify the currently active grading period for a course."""
+    try:
+        resp = session.get(f"{base_url}/api/v1/courses/{course_id}/grading_periods", timeout=10)
+        gps_data = resp.json().get("grading_periods", []) if resp.status_code == 200 else []
+        active_gp = None
+        for gp in gps_data:
+            try:
+                start = datetime.strptime(gp["start_date"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                end = datetime.strptime(gp["end_date"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                if start <= now <= end:
+                    active_gp = gp
+                    break
+            except Exception:
+                pass
+        if not active_gp:
+            active_gp = next((gp for gp in gps_data if not gp.get("is_closed")), None)
+        return course_id, (active_gp["id"] if active_gp else None)
+    except Exception:
+        return course_id, None
 
 
 def fetch_course_gradebook(base_url: str, token: str, course_id: int, student_id: int) -> dict:
     """Fetch all submissions, assignment groups, and weighting metadata for a single course and student,
-    replicating the detailed calculation logic from canvas_gradebook.py.
+    replicating the detailed calculation logic from canvas_gradebook.py concurrently.
     """
     script_dir = str(Path(__file__).resolve().parent)
     if script_dir not in sys.path:
@@ -516,19 +590,46 @@ def fetch_course_gradebook(base_url: str, token: str, course_id: int, student_id
 
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
+    adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
-    # 1. Submissions for this student in this course
-    submissions = fetch_all(
-        session,
-        f"{base_url}/api/v1/courses/{course_id}/students/submissions",
-        params={"student_ids[]": [student_id], "include[]": ["assignment"]}
-    )
+    # 1. Fetch submissions, assignment groups, and course info concurrently
+    submissions = []
+    ags = []
+    course_info = {}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        sub_future = executor.submit(
+            fetch_all,
+            session,
+            f"{base_url}/api/v1/courses/{course_id}/students/submissions",
+            params={"student_ids[]": [student_id], "include[]": ["assignment"]}
+        )
+        ag_future = executor.submit(
+            fetch_all,
+            session,
+            f"{base_url}/api/v1/courses/{course_id}/assignment_groups"
+        )
+        def _get_info():
+            try:
+                c_resp = session.get(f"{base_url}/api/v1/courses/{course_id}", timeout=10)
+                return c_resp.json() if c_resp.status_code == 200 else {}
+            except Exception:
+                return {}
+        info_future = executor.submit(_get_info)
 
-    # 2. Assignment groups
-    try:
-        ags = fetch_all(session, f"{base_url}/api/v1/courses/{course_id}/assignment_groups")
-    except Exception:
-        ags = []
+        try:
+            submissions = sub_future.result()
+        except Exception:
+            submissions = []
+        try:
+            ags = ag_future.result()
+        except Exception:
+            ags = []
+        try:
+            course_info = info_future.result()
+        except Exception:
+            course_info = {}
 
     groups_by_id = {}
     group_weights = {}
@@ -541,18 +642,11 @@ def fetch_course_gradebook(base_url: str, token: str, course_id: int, student_id
                 except (ValueError, TypeError):
                     pass
 
-    # 3. Course info for weighted check
-    try:
-        c_resp = session.get(f"{base_url}/api/v1/courses/{course_id}", timeout=10)
-        course_info = c_resp.json() if c_resp.status_code == 200 else {}
-    except Exception:
-        course_info = {}
-
     weighted = bool(course_info.get("apply_assignment_group_weights")) or any(
         wt > 0 for wt in group_weights.values()
     )
 
-    # 4. Build, sort rows, attach impacts & category health
+    # 2. Build, sort rows, attach impacts & category health
     rows = build_gradebook_rows(submissions, groups_by_id, weighted, sid=student_id)
     attach_grade_impacts(rows, weighted, group_weights)
     rows = sort_gradebook_rows(rows)
@@ -588,8 +682,9 @@ def collect_canvas_data(base_url: str = None, token: str = None, grades_only: bo
 
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
-    adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+    adapter = requests.adapters.HTTPAdapter(pool_connections=35, pool_maxsize=35)
     session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
     # 1. Fetch observees
     try:
@@ -619,61 +714,49 @@ def collect_canvas_data(base_url: str = None, token: str = None, grades_only: bo
     student_assignments = {sid: [] for sid in student_ids}
     student_enrollments = {sid: [] for sid in student_ids}
 
-    # 3. Determine active grading periods
+    # 3. Determine active grading periods concurrently across all academic courses
     active_gps = {}
     now = datetime.now(timezone.utc)
-    for c in academic_courses:
-        try:
-            gps_resp = session.get(f"{base_url}/api/v1/courses/{c['id']}/grading_periods", timeout=10).json()
-            gps_data = gps_resp.get("grading_periods", [])
-            active_gp = None
-            for gp in gps_data:
+    if academic_courses:
+        with ThreadPoolExecutor(max_workers=min(25, len(academic_courses))) as gp_executor:
+            gp_futures = [
+                gp_executor.submit(fetch_active_grading_period, session, c['id'], base_url, now)
+                for c in academic_courses
+            ]
+            for f in as_completed(gp_futures):
                 try:
-                    start = datetime.strptime(gp["start_date"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                    end = datetime.strptime(gp["end_date"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                    if start <= now <= end:
-                        active_gp = gp
-                        break
+                    cid, gpid = f.result()
+                    active_gps[cid] = gpid
                 except Exception:
                     pass
-            if not active_gp:
-                active_gp = next((gp for gp in gps_data if not gp.get("is_closed")), None)
-            active_gps[c['id']] = active_gp["id"] if active_gp else None
-        except Exception:
-            active_gps[c['id']] = None
 
-    # 4. Fetch submissions, enrollments, and group grades concurrently
+    # 4. Fetch course data (submissions + groups) and student enrollments concurrently
     all_submissions = []
     group_grades_results = []
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        submission_futures = []
-        if not grades_only:
-            submission_futures = [
-                executor.submit(fetch_course_submissions, course, session, student_ids, base_url)
-                for course in academic_courses
-            ]
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        course_futures = [
+            executor.submit(fetch_course_data, course, session, student_ids, active_gps.get(course["id"]), base_url)
+            for course in academic_courses
+        ]
         enrollment_futures = {
             sid: executor.submit(fetch_student_enrollments, session, sid, active_gps, base_url)
             for sid in student_ids
         }
-        group_grade_futures = [
-            executor.submit(fetch_assignment_group_grades, session, course["id"], course["name"], student_ids, active_gps.get(course["id"]), base_url)
-            for course in academic_courses
-        ]
 
-        for future in submission_futures:
-            all_submissions.extend(future.result())
+        for future in course_futures:
+            try:
+                subs, grp_grades = future.result()
+                if not grades_only:
+                    all_submissions.extend(subs)
+                group_grades_results.extend(grp_grades)
+            except Exception:
+                pass
 
         for sid, future in enrollment_futures.items():
             try:
                 student_enrollments[sid] = future.result()
             except Exception:
                 student_enrollments[sid] = []
-
-        for future in group_grade_futures:
-            try:
-                group_grades_results.extend(future.result())
-            except Exception:
                 pass
 
     # 5. Organize group grades by student
